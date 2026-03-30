@@ -29,22 +29,9 @@ contract AegisEscrow is Ownable, ReentrancyGuard {
 
     mapping(uint256 escrowId => Escrow) private _escrows;
 
-    event Deposited(
-        uint256 indexed escrowId,
-        address indexed payer,
-        address indexed recipient,
-        uint256 amount
-    );
-    event Released(
-        uint256 indexed escrowId,
-        address indexed recipient,
-        uint256 amount
-    );
-    event Refunded(
-        uint256 indexed escrowId,
-        address indexed payer,
-        uint256 amount
-    );
+    event Deposited(uint256 indexed escrowId, address indexed payer, address indexed recipient, uint256 amount);
+    event Released(uint256 indexed escrowId, address indexed recipient, uint256 amount);
+    event Refunded(uint256 indexed escrowId, address indexed payer, uint256 amount);
 
     constructor(address admin) Ownable(admin) {
         if (admin == address(0)) {
@@ -67,12 +54,7 @@ contract AegisEscrow is Ownable, ReentrancyGuard {
             revert EscrowAlreadyExists(escrowId);
         }
 
-        _escrows[escrowId] = Escrow({
-            payer: msg.sender,
-            recipient: recipient,
-            amount: msg.value,
-            status: Status.Funded
-        });
+        _escrows[escrowId] = Escrow({payer: msg.sender, recipient: recipient, amount: msg.value, status: Status.Funded});
 
         emit Deposited(escrowId, msg.sender, recipient, msg.value);
     }
@@ -125,4 +107,3 @@ contract AegisEscrow is Ownable, ReentrancyGuard {
         return _escrows[escrowId].status;
     }
 }
-

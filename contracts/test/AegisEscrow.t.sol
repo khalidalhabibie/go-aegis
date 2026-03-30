@@ -15,22 +15,9 @@ contract AegisEscrowTest is Test {
     uint256 internal constant ESCROW_ID = 1;
     uint256 internal constant DEPOSIT_AMOUNT = 1 ether;
 
-    event Deposited(
-        uint256 indexed escrowId,
-        address indexed payer,
-        address indexed recipient,
-        uint256 amount
-    );
-    event Released(
-        uint256 indexed escrowId,
-        address indexed recipient,
-        uint256 amount
-    );
-    event Refunded(
-        uint256 indexed escrowId,
-        address indexed payer,
-        uint256 amount
-    );
+    event Deposited(uint256 indexed escrowId, address indexed payer, address indexed recipient, uint256 amount);
+    event Released(uint256 indexed escrowId, address indexed recipient, uint256 amount);
+    event Refunded(uint256 indexed escrowId, address indexed payer, uint256 amount);
 
     function setUp() external {
         escrow = new AegisEscrow(admin);
@@ -92,9 +79,7 @@ contract AegisEscrowTest is Test {
         escrow.deposit{value: DEPOSIT_AMOUNT}(ESCROW_ID, recipient);
 
         vm.prank(payer);
-        vm.expectRevert(
-            abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", payer)
-        );
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", payer));
         escrow.release(ESCROW_ID);
     }
 
@@ -112,4 +97,3 @@ contract AegisEscrowTest is Test {
         vm.stopPrank();
     }
 }
-
