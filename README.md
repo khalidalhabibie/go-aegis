@@ -112,7 +112,9 @@ Aegis is a production-style Go backend scaffold for orchestrating EVM-compatible
 │   ├── 000007_transfer_outbox.down.sql
 │   ├── 000007_transfer_outbox.up.sql
 │   ├── 000008_transaction_attempt_recovery.down.sql
-│   └── 000008_transaction_attempt_recovery.up.sql
+│   ├── 000008_transaction_attempt_recovery.up.sql
+│   ├── 000009_webhook_delivery_leases.down.sql
+│   └── 000009_webhook_delivery_leases.up.sql
 ├── .dockerignore
 ├── .env.example
 ├── Dockerfile
@@ -151,6 +153,7 @@ Aegis is a production-style Go backend scaffold for orchestrating EVM-compatible
    psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000006_reconciliation_results.up.sql
    psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000007_transfer_outbox.up.sql
    psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000008_transaction_attempt_recovery.up.sql
+   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000009_webhook_delivery_leases.up.sql
    ```
 
 4. Install Go dependencies and run the API.
@@ -216,6 +219,7 @@ Notes:
 - Transfer status history table with initial `CREATED` transition writes and every later transition recorded
 - Wallet registry API with duplicate active-wallet protection on the same chain/address
 - Webhook delivery worker for `SUBMITTED`, `CONFIRMED`, and `FAILED` transfer status events with retry/backoff and persisted delivery logs
+- Multi-worker-safe webhook claiming with `IN_PROGRESS` leases and expired-lease reclamation
 - Manual reconciliation job plus mismatch query API backed by persisted reconciliation results
 - Mock signer and mock blockchain broadcaster placeholders for future replacement
 - Initial schema for transfer requests, transaction attempts, and webhook deliveries

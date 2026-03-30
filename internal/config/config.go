@@ -63,6 +63,7 @@ type WebhookConfig struct {
 	MaxAttempts    int           `env:"WEBHOOK_MAX_ATTEMPTS" envDefault:"5"`
 	InitialBackoff time.Duration `env:"WEBHOOK_INITIAL_BACKOFF" envDefault:"2s"`
 	BatchSize      int           `env:"WEBHOOK_BATCH_SIZE" envDefault:"25"`
+	LeaseDuration  time.Duration `env:"WEBHOOK_LEASE_DURATION" envDefault:"30s"`
 }
 
 type DatabaseConfig struct {

@@ -3,6 +3,8 @@ package webhooks
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,7 +14,7 @@ import (
 func TestServiceRunCycleMarksDelivered(t *testing.T) {
 	repo := &stubRepository{
 		scheduleFn: func(context.Context, int) (int64, error) { return 1, nil },
-		listDueFn: func(context.Context, int) ([]Delivery, error) {
+		claimDueFn: func(context.Context, int, time.Duration) ([]Delivery, error) {
 			return []Delivery{{
 				ID:                "delivery-1",
 				TransferRequestID: "transfer-1",
@@ -28,7 +30,7 @@ func TestServiceRunCycleMarksDelivered(t *testing.T) {
 		},
 	}
 
-	service := NewService(repo, dispatcher, 5, time.Second, 10, zerolog.Nop())
+	service := NewService(repo, dispatcher, 5, time.Second, 10, 30*time.Second, zerolog.Nop())
 
 	if err := service.RunCycle(context.Background()); err != nil {
 		t.Fatalf("expected no error, got %v", err)
@@ -42,7 +44,7 @@ func TestServiceRunCycleMarksDelivered(t *testing.T) {
 func TestServiceRunCycleSchedulesRetry(t *testing.T) {
 	repo := &stubRepository{
 		scheduleFn: func(context.Context, int) (int64, error) { return 0, nil },
-		listDueFn: func(context.Context, int) ([]Delivery, error) {
+		claimDueFn: func(context.Context, int, time.Duration) ([]Delivery, error) {
 			return []Delivery{{
 				ID:                "delivery-2",
 				TransferRequestID: "transfer-2",
@@ -55,7 +57,7 @@ func TestServiceRunCycleSchedulesRetry(t *testing.T) {
 		err: errors.New("network down"),
 	}
 
-	service := NewService(repo, dispatcher, 5, time.Second, 10, zerolog.Nop())
+	service := NewService(repo, dispatcher, 5, time.Second, 10, 30*time.Second, zerolog.Nop())
 
 	if err := service.RunCycle(context.Background()); err != nil {
 		t.Fatalf("expected no error, got %v", err)
@@ -66,9 +68,62 @@ func TestServiceRunCycleSchedulesRetry(t *testing.T) {
 	}
 }
 
+func TestServiceRunCycleClaimsDeliveryOnceAcrossConcurrentWorkers(t *testing.T) {
+	var mu sync.Mutex
+	claimed := false
+
+	repo := &stubRepository{
+		scheduleFn: func(context.Context, int) (int64, error) { return 0, nil },
+		claimDueFn: func(context.Context, int, time.Duration) ([]Delivery, error) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			if claimed {
+				return nil, nil
+			}
+
+			claimed = true
+
+			return []Delivery{{
+				ID:                "delivery-3",
+				TransferRequestID: "transfer-3",
+				TransferStatus:    "SUBMITTED",
+				MaxAttempts:       5,
+			}}, nil
+		},
+	}
+
+	dispatcher := &stubDispatcher{
+		result: DispatchResult{StatusCode: 200, Body: "ok"},
+	}
+
+	service := NewService(repo, dispatcher, 5, time.Second, 10, 30*time.Second, zerolog.Nop())
+
+	start := make(chan struct{})
+	var group sync.WaitGroup
+	group.Add(2)
+
+	for worker := 0; worker < 2; worker++ {
+		go func() {
+			defer group.Done()
+			<-start
+			if err := service.RunCycle(context.Background()); err != nil {
+				t.Errorf("expected no error, got %v", err)
+			}
+		}()
+	}
+
+	close(start)
+	group.Wait()
+
+	if dispatcher.calls.Load() != 1 {
+		t.Fatalf("expected exactly one dispatch call, got %d", dispatcher.calls.Load())
+	}
+}
+
 type stubRepository struct {
 	scheduleFn func(ctx context.Context, maxAttempts int) (int64, error)
-	listDueFn  func(ctx context.Context, limit int) ([]Delivery, error)
+	claimDueFn func(ctx context.Context, limit int, leaseDuration time.Duration) ([]Delivery, error)
 	delivered  *MarkDeliveredParams
 	retry      *MarkRetryParams
 	failed     *MarkFailedParams
@@ -82,12 +137,12 @@ func (s *stubRepository) ScheduleTransferStatusDeliveries(ctx context.Context, m
 	return s.scheduleFn(ctx, maxAttempts)
 }
 
-func (s *stubRepository) ListDueDeliveries(ctx context.Context, limit int) ([]Delivery, error) {
-	if s.listDueFn == nil {
+func (s *stubRepository) ClaimDueDeliveries(ctx context.Context, limit int, leaseDuration time.Duration) ([]Delivery, error) {
+	if s.claimDueFn == nil {
 		return nil, nil
 	}
 
-	return s.listDueFn(ctx, limit)
+	return s.claimDueFn(ctx, limit, leaseDuration)
 }
 
 func (s *stubRepository) MarkDelivered(_ context.Context, params MarkDeliveredParams) error {
@@ -108,8 +163,10 @@ func (s *stubRepository) MarkFailed(_ context.Context, params MarkFailedParams) 
 type stubDispatcher struct {
 	result DispatchResult
 	err    error
+	calls  atomic.Int32
 }
 
 func (s *stubDispatcher) Dispatch(context.Context, Delivery) (DispatchResult, error) {
+	s.calls.Add(1)
 	return s.result, s.err
 }

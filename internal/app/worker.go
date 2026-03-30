@@ -75,6 +75,7 @@ func RunWorker(ctx context.Context) error {
 		cfg.Webhook.MaxAttempts,
 		cfg.Webhook.InitialBackoff,
 		cfg.Webhook.BatchSize,
+		cfg.Webhook.LeaseDuration,
 		container.Logger,
 	)
 	webhookWorker := webhooks.NewWorker(webhookService, cfg.Worker.WebhookPollInterval)
