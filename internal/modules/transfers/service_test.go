@@ -35,7 +35,7 @@ func TestCreateTransferNormalizesInput(t *testing.T) {
 		IdempotencyKey:     " idem-1 ",
 		Chain:              "ethereum",
 		AssetType:          "native",
-		SourceWalletID:     "wallet_123",
+		SourceWalletID:     "00000000-0000-0000-0000-000000000123",
 		DestinationAddress: "0x000000000000000000000000000000000000dEaD",
 		Amount:             "1000000",
 		CallbackURL:        "https://example.com/webhook",
@@ -61,7 +61,7 @@ func TestCreateTransferRejectsInvalidAmount(t *testing.T) {
 		IdempotencyKey:     "idem-1",
 		Chain:              "ethereum",
 		AssetType:          "native",
-		SourceWalletID:     "wallet_123",
+		SourceWalletID:     "00000000-0000-0000-0000-000000000123",
 		DestinationAddress: "0x000000000000000000000000000000000000dEaD",
 		Amount:             "12.5",
 	})
@@ -101,6 +101,26 @@ func TestListTransfersNormalizesPagination(t *testing.T) {
 
 	if result.Limit != 100 {
 		t.Fatalf("expected normalized result limit 100, got %d", result.Limit)
+	}
+}
+
+func TestCreateTransferRejectsInvalidSourceWalletID(t *testing.T) {
+	service := NewService(&stubRepository{}, zerolog.Nop())
+
+	_, _, err := service.CreateTransfer(context.Background(), CreateInput{
+		IdempotencyKey:     "idem-1",
+		Chain:              "ethereum",
+		AssetType:          "native",
+		SourceWalletID:     "wallet_123",
+		DestinationAddress: "0x000000000000000000000000000000000000dEaD",
+		Amount:             "1000",
+	})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("expected validation error, got %v", err)
 	}
 }
 

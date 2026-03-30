@@ -114,7 +114,9 @@ Aegis is a production-style Go backend scaffold for orchestrating EVM-compatible
 │   ├── 000008_transaction_attempt_recovery.down.sql
 │   ├── 000008_transaction_attempt_recovery.up.sql
 │   ├── 000009_webhook_delivery_leases.down.sql
-│   └── 000009_webhook_delivery_leases.up.sql
+│   ├── 000009_webhook_delivery_leases.up.sql
+│   ├── 000010_transfer_integrity_constraints.down.sql
+│   └── 000010_transfer_integrity_constraints.up.sql
 ├── .dockerignore
 ├── .env.example
 ├── Dockerfile
@@ -154,6 +156,7 @@ Aegis is a production-style Go backend scaffold for orchestrating EVM-compatible
    psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000007_transfer_outbox.up.sql
    psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000008_transaction_attempt_recovery.up.sql
    psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000009_webhook_delivery_leases.up.sql
+   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000010_transfer_integrity_constraints.up.sql
    ```
 
 4. Install Go dependencies and run the API.
@@ -217,6 +220,8 @@ Notes:
 - Durable transaction attempts so signed payloads and `tx_hash` survive worker crashes during submission
 - Resumable status machine: `CREATED -> VALIDATED -> QUEUED -> SIGNING -> SUBMITTED -> PENDING_ON_CHAIN`
 - Transfer status history table with initial `CREATED` transition writes and every later transition recorded
+- Database integrity constraints for transfer statuses, wallet statuses, and transaction attempt statuses
+- Transfer `source_wallet_id` enforced as a wallet foreign key
 - Wallet registry API with duplicate active-wallet protection on the same chain/address
 - Webhook delivery worker for `SUBMITTED`, `CONFIRMED`, and `FAILED` transfer status events with retry/backoff and persisted delivery logs
 - Multi-worker-safe webhook claiming with `IN_PROGRESS` leases and expired-lease reclamation
@@ -236,7 +241,7 @@ curl --request POST \
     "idempotency_key": "txn-001",
     "chain": "ethereum",
     "asset_type": "native",
-    "source_wallet_id": "wallet_hot_001",
+    "source_wallet_id": "00000000-0000-0000-0000-000000000001",
     "destination_address": "0x000000000000000000000000000000000000dEaD",
     "amount": "1000000000000000000",
     "callback_url": "https://example.com/webhooks/transfers",
@@ -256,7 +261,7 @@ Sample response:
     "idempotency_key": "txn-001",
     "chain": "ethereum",
     "asset_type": "native",
-    "source_wallet_id": "wallet_hot_001",
+    "source_wallet_id": "00000000-0000-0000-0000-000000000001",
     "destination_address": "0x000000000000000000000000000000000000dEaD",
     "amount": "1000000000000000000",
     "callback_url": "https://example.com/webhooks/transfers",

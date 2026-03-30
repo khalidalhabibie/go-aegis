@@ -92,6 +92,8 @@ func (h *TransferHandler) handleServiceError(c *gin.Context, err error) {
 	switch {
 	case errors.Is(err, transfers.ErrValidation):
 		writeError(c, http.StatusBadRequest, "validation_error", err.Error())
+	case errors.Is(err, transfers.ErrSourceWalletNotFound):
+		writeError(c, http.StatusBadRequest, "source_wallet_not_found", "source wallet does not exist")
 	case errors.Is(err, transfers.ErrTransferNotFound):
 		writeError(c, http.StatusNotFound, "transfer_not_found", "transfer not found")
 	default:
