@@ -14,6 +14,7 @@ import (
 
 func NewServer(
 	cfg config.HTTPConfig,
+	internalAuthCfg config.InternalAuthConfig,
 	environment string,
 	log zerolog.Logger,
 	healthHandler *handlers.HealthHandler,
@@ -32,11 +33,14 @@ func NewServer(
 	apiV1.POST("/transfers", transferHandler.Create)
 	apiV1.GET("/transfers/:id", transferHandler.GetByID)
 	apiV1.GET("/transfers", transferHandler.List)
-	apiV1.POST("/wallets", walletHandler.Create)
-	apiV1.GET("/wallets", walletHandler.List)
-	apiV1.GET("/wallets/:id", walletHandler.GetByID)
-	apiV1.POST("/jobs/reconcile", reconciliationHandler.Run)
-	apiV1.GET("/reconciliation/mismatches", reconciliationHandler.ListMismatches)
+
+	internalOps := apiV1.Group("")
+	internalOps.Use(internalAuthMiddleware(internalAuthCfg, log))
+	internalOps.POST("/wallets", walletHandler.Create)
+	internalOps.GET("/wallets", walletHandler.List)
+	internalOps.GET("/wallets/:id", walletHandler.GetByID)
+	internalOps.POST("/jobs/reconcile", reconciliationHandler.Run)
+	internalOps.GET("/reconciliation/mismatches", reconciliationHandler.ListMismatches)
 
 	return &http.Server{
 		Addr:              cfg.Address(),
