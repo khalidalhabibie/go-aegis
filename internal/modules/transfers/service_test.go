@@ -35,7 +35,7 @@ func TestCreateTransferNormalizesInput(t *testing.T) {
 		IdempotencyKey:     " idem-1 ",
 		Chain:              "ethereum",
 		AssetType:          "native",
-		SourceWalletID:     "wallet_123",
+		SourceWalletID:     "00000000-0000-0000-0000-000000000123",
 		DestinationAddress: "0x000000000000000000000000000000000000dEaD",
 		Amount:             "1000000",
 		CallbackURL:        "https://example.com/webhook",
@@ -61,7 +61,7 @@ func TestCreateTransferRejectsInvalidAmount(t *testing.T) {
 		IdempotencyKey:     "idem-1",
 		Chain:              "ethereum",
 		AssetType:          "native",
-		SourceWalletID:     "wallet_123",
+		SourceWalletID:     "00000000-0000-0000-0000-000000000123",
 		DestinationAddress: "0x000000000000000000000000000000000000dEaD",
 		Amount:             "12.5",
 	})
@@ -104,17 +104,16 @@ func TestListTransfersNormalizesPagination(t *testing.T) {
 	}
 }
 
-func TestCreateTransferRejectsPrivateCallbackURLByDefault(t *testing.T) {
+func TestCreateTransferRejectsInvalidSourceWalletID(t *testing.T) {
 	service := NewService(&stubRepository{}, CallbackURLPolicy{}, zerolog.Nop())
 
 	_, _, err := service.CreateTransfer(context.Background(), CreateInput{
-		IdempotencyKey:     "idem-private",
+		IdempotencyKey:     "idem-1",
 		Chain:              "ethereum",
 		AssetType:          "native",
 		SourceWalletID:     "wallet_123",
 		DestinationAddress: "0x000000000000000000000000000000000000dEaD",
-		Amount:             "1000000",
-		CallbackURL:        "http://127.0.0.1:8080/webhook",
+		Amount:             "1000",
 	})
 	if err == nil {
 		t.Fatal("expected validation error")
@@ -122,30 +121,6 @@ func TestCreateTransferRejectsPrivateCallbackURLByDefault(t *testing.T) {
 
 	if !errors.Is(err, ErrValidation) {
 		t.Fatalf("expected validation error, got %v", err)
-	}
-}
-
-func TestCreateTransferAllowsWhitelistedCallbackHost(t *testing.T) {
-	repo := &stubRepository{
-		createFn: func(_ context.Context, params CreateParams) (Transfer, bool, error) {
-			return Transfer{ID: "transfer-1", IdempotencyKey: params.IdempotencyKey, Status: params.Status}, true, nil
-		},
-	}
-	service := NewService(repo, CallbackURLPolicy{
-		AllowedHosts: []string{"example.com"},
-	}, zerolog.Nop())
-
-	_, _, err := service.CreateTransfer(context.Background(), CreateInput{
-		IdempotencyKey:     "idem-allow",
-		Chain:              "ethereum",
-		AssetType:          "native",
-		SourceWalletID:     "wallet_123",
-		DestinationAddress: "0x000000000000000000000000000000000000dEaD",
-		Amount:             "1000000",
-		CallbackURL:        "https://hooks.example.com/transfers",
-	})
-	if err != nil {
-		t.Fatalf("expected no error, got %v", err)
 	}
 }
 

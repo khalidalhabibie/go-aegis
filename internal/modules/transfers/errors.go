@@ -6,6 +6,9 @@ import (
 )
 
 var ErrInvalidTransferState = errors.New("invalid transfer state")
+var ErrInvalidTransferStatus = errors.New("invalid transfer status")
+var ErrInvalidTransactionAttemptStatus = errors.New("invalid transaction attempt status")
+var ErrSourceWalletNotFound = errors.New("source wallet not found")
 var ErrTransient = errors.New("transient error")
 var ErrTransactionAttemptNotFound = errors.New("transaction attempt not found")
 

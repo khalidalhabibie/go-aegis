@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -16,7 +17,7 @@ const transferSelectColumns = `
 	idempotency_key,
 	chain,
 	asset_type,
-	source_wallet_id,
+	source_wallet_id::text,
 	destination_address,
 	amount::text,
 	callback_url,
@@ -98,7 +99,7 @@ func (r *PostgresRepository) Create(ctx context.Context, params CreateParams) (T
 			return existing, false, nil
 		}
 
-		return Transfer{}, false, fmt.Errorf("insert transfer request: %w", err)
+		return Transfer{}, false, mapTransferWriteError("insert transfer request", err)
 	}
 
 	if _, err := tx.Exec(
@@ -234,7 +235,7 @@ func (r *PostgresRepository) TransitionStatus(ctx context.Context, params Transi
 			}
 		}
 
-		return Transfer{}, fmt.Errorf("update transfer status: %w", err)
+		return Transfer{}, mapTransferWriteError("update transfer status", err)
 	}
 
 	if _, err := tx.Exec(
@@ -297,7 +298,7 @@ func (r *PostgresRepository) CreateAttempt(ctx context.Context, params CreateAtt
 		params.ErrorMessage,
 	))
 	if err != nil {
-		return TransactionAttempt{}, fmt.Errorf("create transaction attempt: %w", err)
+		return TransactionAttempt{}, mapTransferWriteError("create transaction attempt", err)
 	}
 
 	return attempt, nil
@@ -321,7 +322,7 @@ func (r *PostgresRepository) UpdateAttempt(ctx context.Context, params UpdateAtt
 			return TransactionAttempt{}, ErrTransactionAttemptNotFound
 		}
 
-		return TransactionAttempt{}, fmt.Errorf("update transaction attempt: %w", err)
+		return TransactionAttempt{}, mapTransferWriteError("update transaction attempt", err)
 	}
 
 	return attempt, nil
@@ -540,4 +541,27 @@ func scanAttempt(scanner rowScanner) (TransactionAttempt, error) {
 	attempt.RawPayload = json.RawMessage(rawPayload)
 
 	return attempt, nil
+}
+
+func mapTransferWriteError(operation string, err error) error {
+	var pgError *pgconn.PgError
+	if !errors.As(err, &pgError) {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+
+	switch pgError.Code {
+	case "23503":
+		if pgError.ConstraintName == "fk_transfer_requests_source_wallet_id" {
+			return fmt.Errorf("%s: %w", operation, ErrSourceWalletNotFound)
+		}
+	case "23514":
+		switch pgError.ConstraintName {
+		case "chk_transfer_requests_status", "chk_transfer_status_history_from_status", "chk_transfer_status_history_to_status":
+			return fmt.Errorf("%s: %w", operation, ErrInvalidTransferStatus)
+		case "chk_transaction_attempts_status":
+			return fmt.Errorf("%s: %w", operation, ErrInvalidTransactionAttemptStatus)
+		}
+	}
+
+	return fmt.Errorf("%s: %w", operation, err)
 }

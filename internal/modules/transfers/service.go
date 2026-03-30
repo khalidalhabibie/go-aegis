@@ -167,6 +167,10 @@ func normalizeCreateInput(input CreateInput, callbackURLPolicy CallbackURLPolicy
 		return CreateParams{}, ValidationError{Field: "source_wallet_id", Message: "is required"}
 	}
 
+	if _, err := uuid.Parse(params.SourceWalletID); err != nil {
+		return CreateParams{}, ValidationError{Field: "source_wallet_id", Message: "must be a valid UUID"}
+	}
+
 	if params.DestinationAddress == "" {
 		return CreateParams{}, ValidationError{Field: "destination_address", Message: "is required"}
 	}
