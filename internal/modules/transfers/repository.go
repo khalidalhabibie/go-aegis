@@ -52,7 +52,8 @@ type CreateAttemptParams struct {
 }
 
 type UpdateAttemptParams struct {
-	AttemptID    string
-	Status       string
-	ErrorMessage string
+	AttemptID      string
+	ExpectedStatus string
+	Status         string
+	ErrorMessage   string
 }

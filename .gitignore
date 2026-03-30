@@ -25,6 +25,7 @@ logs/
 *.swp
 *.swo
 .DS_Store
+.code*
 
 # Dependency directories
 vendor/

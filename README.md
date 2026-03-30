@@ -1,383 +1,327 @@
 # Aegis
 
-Aegis is a production-style Go backend scaffold for orchestrating EVM-compatible transfer workflows. The project is structured as a modular monolith so API, worker, infrastructure wiring, and future orchestration modules can grow without fragmenting into premature abstractions.
+Aegis is a Go backend for orchestrating EVM-compatible transfer workflows. It exposes an API for transfer creation and lookup, persists workflow state in PostgreSQL, dispatches transfer work through RabbitMQ, uses Redis to reduce duplicate processing, delivers outbound status webhooks, and provides internal reconciliation endpoints.
 
-## Stack
+## Project Overview
 
-- Go + Gin
-- PostgreSQL via `pgxpool`
-- Redis via `go-redis`
-- RabbitMQ via `amqp091-go`
-- EVM adapter via `go-ethereum`
-- Structured JSON logs via `zerolog`
-- Docker + Docker Compose
+### What Aegis does
 
-## Project Structure
+- Accepts transfer requests with idempotency keys.
+- Persists transfer state and status history in PostgreSQL.
+- Dispatches transfer jobs asynchronously through a transactional outbox.
+- Tracks durable blockchain submission attempts so retries can resume from stored state.
+- Schedules and delivers transfer status webhooks with retry and lease-based claiming.
+- Provides internal wallet and reconciliation endpoints for operational workflows.
 
-```text
-.
-├── cmd
-│   ├── api
-│   │   └── main.go
-│   └── worker
-│       └── main.go
-├── internal
-│   ├── app
-│   │   ├── api.go
-│   │   ├── transfers.go
-│   │   └── worker.go
-│   ├── bootstrap
-│   │   └── container.go
-│   ├── config
-│   │   └── config.go
-│   ├── modules
-│   │   ├── health
-│   │   │   └── service.go
-│   │   ├── reconciliation
-│   │   │   ├── checker.go
-│   │   │   ├── model.go
-│   │   │   ├── postgres_repository.go
-│   │   │   ├── repository.go
-│   │   │   ├── service.go
-│   │   │   └── service_test.go
-│   │   ├── transfers
-│   │       ├── consumer.go
-│   │       ├── errors.go
-│   │       ├── job.go
-│   │       ├── lock.go
-│   │       ├── model.go
-│   │       ├── mocks.go
-│   │       ├── attempt.go
-│   │       ├── outbox.go
-│   │       ├── outbox_dispatcher.go
-│   │       ├── outbox_dispatcher_test.go
-│   │       ├── outbox_repository.go
-│   │       ├── processor.go
-│   │       ├── processor_test.go
-│   │       ├── postgres_repository.go
-│   │       ├── publisher.go
-│   │       ├── repository.go
-│   │       ├── service.go
-│   │       └── service_test.go
-│   │   └── webhooks
-│   │       ├── dispatcher.go
-│   │       ├── model.go
-│   │       ├── postgres_repository.go
-│   │       ├── repository.go
-│   │       ├── service.go
-│   │       ├── service_test.go
-│   │       └── worker.go
-│   │   └── wallets
-│   │       ├── model.go
-│   │       ├── postgres_repository.go
-│   │       ├── repository.go
-│   │       ├── service.go
-│   │       └── service_test.go
-│   ├── platform
-│   │   ├── blockchain
-│   │   │   └── evm.go
-│   │   ├── logger
-│   │   │   └── logger.go
-│   │   ├── postgres
-│   │   │   └── postgres.go
-│   │   ├── rabbitmq
-│   │   │   └── rabbitmq.go
-│   │   └── redis
-│   │       └── redis.go
-│   └── transport
-│       └── http
-│           ├── handlers
-│           │   ├── health.go
-│           │   ├── reconciliation.go
-│           │   ├── reconciliation_dto.go
-│           │   ├── response.go
-│           │   ├── transfers.go
-│           │   ├── transfers_dto.go
-│           │   ├── wallets.go
-│           │   └── wallets_dto.go
-│           ├── internal_auth.go
-│           └── server.go
-├── migrations
-│   ├── 000001_init.down.sql
-│   ├── 000001_init.up.sql
-│   ├── 000002_transfer_status_history.down.sql
-│   ├── 000002_transfer_status_history.up.sql
-│   ├── 000003_transfer_tx_hash.down.sql
-│   ├── 000003_transfer_tx_hash.up.sql
-│   ├── 000004_wallets.down.sql
-│   ├── 000004_wallets.up.sql
-│   ├── 000005_webhook_delivery_extensions.down.sql
-│   ├── 000005_webhook_delivery_extensions.up.sql
-│   ├── 000006_reconciliation_results.down.sql
-│   ├── 000006_reconciliation_results.up.sql
-│   ├── 000007_transfer_outbox.down.sql
-│   ├── 000007_transfer_outbox.up.sql
-│   ├── 000008_transaction_attempt_recovery.down.sql
-│   ├── 000008_transaction_attempt_recovery.up.sql
-│   ├── 000009_webhook_delivery_leases.down.sql
-│   ├── 000009_webhook_delivery_leases.up.sql
-│   ├── 000010_transfer_integrity_constraints.down.sql
-│   └── 000010_transfer_integrity_constraints.up.sql
-├── .dockerignore
-├── .env.example
-├── Dockerfile
-├── docker-compose.yml
-├── go.mod
-└── README.md
+### Key capabilities
+
+- Public transfer API: create, get by ID, list.
+- Worker-side outbox dispatcher for durable RabbitMQ publish.
+- Transfer consumer with Redis-backed duplicate-processing lock.
+- Durable `transaction_attempts` recovery for `SIGNED`, `BROADCASTING`, and `BROADCASTED` states.
+- Webhook retries with exponential backoff, HMAC signing, response body truncation, and lease-fenced multi-worker claiming.
+- Internal authentication for wallet and reconciliation routes.
+- Integrity constraints for transfer status, wallet status, transfer wallet foreign keys, and transaction attempt status/hash rules.
+
+### Current scope and limitations
+
+- The transfer processor is wired for blockchain submission, but the default signer and broadcaster are mocks in `internal/modules/transfers/mocks.go`.
+- Reconciliation uses a placeholder receipt checker in `internal/modules/reconciliation/checker.go`; it is not a real on-chain receipt poller yet.
+- There is no migration runner binary in the repo; SQL migrations are applied manually.
+- There is no automatic confirmation watcher in the worker today. `CONFIRMED` state is driven by reconciliation, not by a dedicated listener.
+
+## Architecture Summary
+
+High-level flow:
+
+`API -> Postgres -> transfer_outbox -> RabbitMQ -> worker -> blockchain signer/broadcaster adapter -> webhook_deliveries -> reconciliation_results`
+
+More concretely:
+
+1. `POST /api/v1/transfers` validates input and writes `transfer_requests`, the initial `transfer_status_history` row, and a `transfer_outbox` event in one PostgreSQL transaction.
+2. The outbox dispatcher polls `transfer_outbox`, claims pending rows, publishes transfer jobs to RabbitMQ, and only marks rows `DISPATCHED` after successful publish.
+3. The transfer consumer reads RabbitMQ jobs, acquires a short Redis lock per transfer, advances the transfer state machine, and persists durable transaction attempts before blockchain submission.
+4. The webhook worker schedules `SUBMITTED`, `CONFIRMED`, and `FAILED` events into `webhook_deliveries`, claims due rows with leases, and retries failed deliveries with backoff.
+5. Internal reconciliation compares stored transfer state with blockchain receipt observations and writes `reconciliation_results`.
+
+### Why the outbox exists
+
+Without the outbox, transfer creation would depend on RabbitMQ being available during the API request. The outbox keeps the create request durable in PostgreSQL first, then lets the worker publish later. That makes queue publish at-least-once and decouples API success from temporary broker outages.
+
+### Why durable transaction attempts exist
+
+Blockchain submission is not safe to treat as a stateless retry. Aegis persists the signed payload, nonce, and deterministic `tx_hash` in `transaction_attempts` before broadcast. If a worker crashes after signing or after broadcast, the next run resumes from the latest durable attempt instead of signing a brand-new transaction.
+
+### Webhook claiming and lease safety
+
+Webhook workers claim due deliveries by moving rows to `IN_PROGRESS` with a lease expiry. Delivery result writes are fenced on both `id` and the claimed `lease_expires_at`, so a stale worker cannot overwrite a newer worker's result after its lease is lost. The worker also enforces an effective lease duration of at least `WEBHOOK_TIMEOUT + 5s` to reduce lease expiry during slow HTTP calls.
+
+## Reliability Model
+
+### Queue publish and outbox dispatch
+
+- Transfer job dispatch is at-least-once.
+- `transfer_outbox` rows stay retryable until RabbitMQ publish succeeds.
+- Duplicate outbox publish is tolerated by design.
+
+### Duplicate-processing prevention
+
+- The transfer consumer uses a Redis lock per transfer ID to reduce concurrent duplicate work.
+- Transfer status transitions are compare-and-set on the current status.
+- `transaction_attempts` updates are compare-and-set on the expected attempt status, so stale workers cannot regress a newer attempt state.
+- Webhook delivery writes require the active lease to still match.
+- Webhook receivers should still treat `X-Aegis-Delivery-ID` as an idempotency key, because webhook delivery is also at-least-once.
+
+### Durable submission recovery
+
+- `SIGNED`: the raw signed transaction, nonce, and `tx_hash` are persisted.
+- `BROADCASTING`: the worker is attempting to submit the exact stored payload.
+- `BROADCASTED`: the worker recorded that broadcast completed and can safely finish transfer state advancement later.
+- On retry, the processor reloads the latest durable attempt and resumes from that state.
+
+### Operational tradeoffs
+
+- RabbitMQ publish and webhook delivery are at-least-once, not exactly-once.
+- Redis locking reduces duplicate transfer work but is still a short-lived operational lock, not a global consensus mechanism.
+- Lease and timeout sizing still matter. The worker raises the effective webhook lease above the HTTP timeout, but production values should still be set deliberately.
+
+## Security Model
+
+### Internal operational authentication
+
+- Wallet and reconciliation routes are protected by `INTERNAL_AUTH_HEADER` and `INTERNAL_AUTH_API_KEY`.
+- If the internal API key is unset, protected routes fail closed with `503 Service Unavailable`.
+
+### Webhook signing
+
+When `WEBHOOK_SIGNING_SECRET` is set, outbound webhooks include:
+
+- `X-Aegis-Timestamp`
+- `X-Aegis-Signature`
+
+The signature format is `v1=<hex hmac sha256>`, computed over `<timestamp>.<raw_body>`.
+
+### Callback URL validation policy
+
+At transfer creation time, callback URLs:
+
+- must use `http` or `https`
+- must not include user credentials
+- reject `localhost`, `.localhost`, `.local`, `.internal`, and private/local IP literals by default
+- can be restricted further with `CALLBACK_URL_ALLOWED_HOSTS`
+- can allow private targets only when `CALLBACK_URL_ALLOW_PRIVATE_TARGETS=true`
+
+At webhook dispatch time, the worker re-validates the resolved destination:
+
+- the hostname is checked against the allowlist policy again
+- DNS results are rejected if any resolved IP is loopback, private, link-local, multicast, or unspecified
+- redirects are re-validated before the client follows them
+
+### SSRF handling note
+
+These controls are application-layer SSRF mitigations. They materially reduce obvious callback abuse, but they are not a replacement for network egress controls. Production deployments should still restrict outbound network paths at the infrastructure layer.
+
+### Response body storage limits
+
+- Webhook response bodies are truncated and sanitized before persistence.
+- `WEBHOOK_RESPONSE_BODY_MAX_BYTES` defaults to `512`.
+- Null bytes are removed and invalid UTF-8 is normalized before storage.
+
+## Local Development
+
+### Prerequisites
+
+- Go `1.20+`
+- Docker and Docker Compose
+- `psql` if you want to apply migrations manually from the shell
+
+### Environment setup
+
+```bash
+cp .env.example .env
 ```
 
-## Prerequisites
+Review `.env` before running the stack, especially:
 
-- Go 1.20+
-- Docker and Docker Compose
+- `INTERNAL_AUTH_API_KEY`
+- `WEBHOOK_SIGNING_SECRET`
+- `CALLBACK_URL_ALLOWED_HOSTS`
+- `CALLBACK_URL_ALLOW_PRIVATE_TARGETS`
+- `EVM_RPC_URL`
 
-## Local Setup
+### Start infrastructure with Docker Compose
 
-1. Copy the environment file.
+```bash
+docker compose up -d postgres redis rabbitmq
+```
 
-   ```bash
-   cp .env.example .env
-   ```
+RabbitMQ management UI is exposed at `http://127.0.0.1:15672`.
 
-2. Start the infrastructure services.
+### Apply migrations
 
-   ```bash
-   docker compose up -d postgres redis rabbitmq
-   ```
+The repo ships raw SQL migrations under `migrations/`. Apply them in filename order:
 
-3. Apply the initial migration.
+```bash
+for f in migrations/*.up.sql; do
+  psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f "$f"
+done
+```
 
-   ```bash
-   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000001_init.up.sql
-   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000002_transfer_status_history.up.sql
-   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000003_transfer_tx_hash.up.sql
-   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000004_wallets.up.sql
-   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000005_webhook_delivery_extensions.up.sql
-   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000006_reconciliation_results.up.sql
-   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000007_transfer_outbox.up.sql
-   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000008_transaction_attempt_recovery.up.sql
-   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000009_webhook_delivery_leases.up.sql
-   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000010_transfer_integrity_constraints.up.sql
-   ```
+### Run the API
 
-4. Install Go dependencies and run the API.
+```bash
+go run ./cmd/api
+```
 
-   ```bash
-   go mod tidy
-   go run ./cmd/api
-   ```
+### Run the worker
 
-5. In a second terminal, run the worker.
+```bash
+go run ./cmd/worker
+```
 
-   ```bash
-   go run ./cmd/worker
-   ```
-
-The health endpoint is available at `http://127.0.0.1:8080/healthz`.
-
-## Docker Compose
-
-To run the full stack in containers:
+### Run the full stack in containers
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
 
-The API container listens on port `8080`. RabbitMQ management is exposed on `http://127.0.0.1:15672`.
-
-## Git Ignore
-
-The repository root includes a `.gitignore` for:
-
-- Go build outputs and caches
-- local `.env` files
-- editor and OS noise
-- Foundry build artifacts and installed libraries under `contracts/`
-
-## CI/CD
-
-GitHub Actions workflows are included under `.github/workflows`:
-
-- `ci.yml`: runs Go formatting checks, Go tests, binary builds, Docker image build validation, and Foundry format/test/build checks
-- `cd.yml`: builds and pushes the production image to `ghcr.io/<owner>/<repo>` on version tags like `v1.0.0` or manual dispatch
-
-Notes:
-
-- The CI workflow installs Foundry dependencies during the run, so contract CI does not depend on committed `contracts/lib` artifacts.
-- The published runtime image contains both `aegis-api` and `aegis-worker`, so the deploy platform can run the same image with different commands for API and worker processes.
-
-## Security Defaults
-
-- Operational routes are protected by a static internal API key header
-- Callback URLs reject localhost and private-network targets by default
-- Optional callback host allowlisting is supported
-- Outbound webhooks can be signed with HMAC SHA-256 using timestamped headers
-- Persisted webhook response bodies are truncated and sanitized before storage
-
-## Current Capabilities
-
-- API and worker processes with separate entrypoints
-- Environment-driven configuration
-- Graceful shutdown plumbing
-- Structured request and runtime logging
-- Postgres, Redis, RabbitMQ, and EVM bootstrap layers
-- Health endpoint covering core dependencies
-- Transfer request create/get/list API with PostgreSQL persistence and idempotency
-- Transactional transfer outbox so create requests do not depend on immediate RabbitMQ publish success
-- RabbitMQ-backed async transfer job dispatch and worker consumption
-- Durable transaction attempts so signed payloads and `tx_hash` survive worker crashes during submission
-- Resumable status machine: `CREATED -> VALIDATED -> QUEUED -> SIGNING -> SUBMITTED -> PENDING_ON_CHAIN`
-- Transfer status history table with initial `CREATED` transition writes and every later transition recorded
-- Database integrity constraints for transfer statuses, wallet statuses, and transaction attempt statuses
-- Transfer `source_wallet_id` enforced as a wallet foreign key
-- Wallet registry API with duplicate active-wallet protection on the same chain/address
-- Webhook delivery worker for `SUBMITTED`, `CONFIRMED`, and `FAILED` transfer status events with retry/backoff and persisted delivery logs
-- Multi-worker-safe webhook claiming with `IN_PROGRESS` leases and expired-lease reclamation
-- Manual reconciliation job plus mismatch query API backed by persisted reconciliation results
-- Mock signer and mock blockchain broadcaster placeholders for future replacement
-- Initial schema for transfer requests, transaction attempts, and webhook deliveries
-- Internal auth middleware for wallet and reconciliation operations
-- Safer callback URL validation and signed outbound webhooks
-
-## Transfer API
-
-### Create a transfer request
+### Test commands
 
 ```bash
-curl --request POST \
-  --url http://127.0.0.1:8080/api/v1/transfers \
-  --header 'Content-Type: application/json' \
-  --data '{
-    "idempotency_key": "txn-001",
-    "chain": "ethereum",
-    "asset_type": "native",
-    "source_wallet_id": "00000000-0000-0000-0000-000000000001",
-    "destination_address": "0x000000000000000000000000000000000000dEaD",
-    "amount": "1000000000000000000",
-    "callback_url": "https://example.com/webhooks/transfers",
-    "metadata_json": {
-      "reference": "merchant-payout-42",
-      "tenant_id": "tenant_abc"
-    }
-  }'
+go test ./...
+go test ./internal/modules/transfers ./internal/modules/webhooks ./internal/transport/http
 ```
 
-Sample response:
+## Configuration
 
-```json
-{
-  "data": {
-    "id": "9ee80db8-c74f-4faf-9f96-2a6a13ac0b58",
-    "idempotency_key": "txn-001",
-    "chain": "ethereum",
-    "asset_type": "native",
-    "source_wallet_id": "00000000-0000-0000-0000-000000000001",
-    "destination_address": "0x000000000000000000000000000000000000dEaD",
-    "amount": "1000000000000000000",
-    "callback_url": "https://example.com/webhooks/transfers",
-    "metadata_json": {
-      "reference": "merchant-payout-42",
-      "tenant_id": "tenant_abc"
-    },
-    "tx_hash": "",
-    "status": "CREATED",
-    "created_at": "2026-03-30T12:00:00Z",
-    "updated_at": "2026-03-30T12:00:00Z"
-  }
-}
-```
+Important environment variables are defined in `.env.example`.
 
-`POST /api/v1/transfers` returns `201 Created` for a new transfer and `200 OK` when the `idempotency_key` already exists.
-The API writes the transfer row and a pending transfer outbox event in one Postgres transaction. A worker-side outbox dispatcher publishes that event to RabbitMQ and retries later if RabbitMQ is unavailable, so the create request remains durable even when the broker is temporarily down.
-The transfer worker asynchronously advances the transfer through validation, queueing, signing, submission, and `PENDING_ON_CHAIN`.
+### Core runtime
 
-Callback URL security policy:
+- `DATABASE_URL`: PostgreSQL connection string.
+- `RABBITMQ_URL`: RabbitMQ connection string.
+- `REDIS_ADDR`: Redis address for duplicate-processing locks.
+- `EVM_RPC_URL`: RPC endpoint used by the EVM adapter and health checks.
+- `EVM_CHAIN_ID`: expected chain ID for RPC validation.
 
-- Only `http` and `https` are allowed
-- userinfo such as `https://user:pass@...` is rejected
-- localhost, loopback, link-local, multicast, and private IP destinations are rejected by default
-- set `CALLBACK_URL_ALLOW_PRIVATE_TARGETS=true` only for trusted internal environments
-- set `CALLBACK_URL_ALLOWED_HOSTS` to a comma-separated allowlist for stricter outbound control
+### Transfer and worker reliability
 
-## Transfer Dispatch Architecture
+- `WORKER_TRANSFER_MAX_RETRIES`: max RabbitMQ job retries after transient transfer errors.
+- `WORKER_TRANSFER_RETRY_DELAY`: delay before a transfer job is republished.
+- `WORKER_TRANSFER_PROCESS_LOCK_TTL`: Redis lock TTL for transfer processing.
+- `WORKER_TRANSFER_OUTBOX_POLL_INTERVAL`: how often the outbox dispatcher polls.
+- `WORKER_TRANSFER_OUTBOX_BATCH_SIZE`: number of outbox rows claimed per batch.
+- `WORKER_TRANSFER_OUTBOX_RETRY_DELAY`: base delay for outbox publish retry backoff.
+- `WORKER_TRANSFER_OUTBOX_PROCESSING_AFTER`: age after which a stuck outbox row can be reclaimed.
+- `WORKER_WEBHOOK_POLL_INTERVAL`: webhook worker polling interval.
 
-Transfer creation uses a transactional outbox:
+### Webhook delivery and signing
 
-1. `POST /api/v1/transfers` inserts the transfer request, writes the initial `CREATED` status history row, and inserts a `transfer_outbox` event in the same database transaction.
-2. The outbox dispatcher polls pending outbox rows and publishes transfer jobs to RabbitMQ.
-3. Outbox rows are marked `DISPATCHED` only after a successful publish.
-4. If publish fails, the row stays retryable and the dispatcher backs off before trying again.
-5. Duplicate outbox dispatch is tolerated. The transfer consumer uses a short-lived Redis lock per transfer to avoid concurrent duplicate processing.
+- `WEBHOOK_TIMEOUT`: HTTP timeout for outbound webhook delivery.
+- `WEBHOOK_MAX_ATTEMPTS`: max webhook delivery attempts before permanent failure.
+- `WEBHOOK_INITIAL_BACKOFF`: base retry delay for webhook delivery.
+- `WEBHOOK_BATCH_SIZE`: number of webhook rows claimed per cycle.
+- `WEBHOOK_LEASE_DURATION`: configured webhook claim lease; the worker raises the effective value if it is shorter than the timeout safety floor.
+- `WEBHOOK_SIGNING_SECRET`: enables outbound HMAC signing when non-empty.
+- `WEBHOOK_RESPONSE_BODY_MAX_BYTES`: persisted response body size cap.
 
-## Durable Submission Recovery
+### Security-related settings
 
-Transfer submission uses `transaction_attempts` as durable recovery state:
+- `INTERNAL_AUTH_HEADER`: header name checked on internal operational routes.
+- `INTERNAL_AUTH_API_KEY`: shared secret for internal operational routes.
+- `CALLBACK_URL_ALLOWED_HOSTS`: optional comma-separated allowlist for callback targets.
+- `CALLBACK_URL_ALLOW_PRIVATE_TARGETS`: set to `true` only for trusted internal environments.
 
-1. When a transfer reaches `SIGNING`, the worker signs it and persists the signed payload, nonce, and deterministic `tx_hash` as a `SIGNED` transaction attempt before broadcast.
-2. The worker moves that attempt to `BROADCASTING` and sends the exact persisted payload to the blockchain adapter.
-3. After broadcast succeeds, the attempt is marked `BROADCASTED`, then the transfer is advanced to `SUBMITTED` and later `PENDING_ON_CHAIN`.
-4. If the worker crashes after broadcast, retries inspect the latest persisted attempt instead of signing a brand-new transaction.
-5. A `BROADCASTING` attempt is safe to rebroadcast because it reuses the same signed payload and `tx_hash`, which avoids accidental double-send semantics.
+## API Summary
 
-### Get a transfer by ID
+### Public endpoints
+
+- `GET /healthz`
+- `POST /api/v1/transfers`
+- `GET /api/v1/transfers/:id`
+- `GET /api/v1/transfers`
+
+### Internal operational endpoints
+
+These routes require the internal auth header and API key:
+
+- `POST /api/v1/wallets`
+- `GET /api/v1/wallets`
+- `GET /api/v1/wallets/:id`
+- `POST /api/v1/jobs/reconcile`
+- `GET /api/v1/reconciliation/mismatches`
+
+## Worker Behavior
+
+### Transfer outbox dispatcher
+
+- Polls `transfer_outbox`
+- claims pending or stale-processing rows
+- publishes transfer jobs to RabbitMQ
+- records retry timing and last publish error
+
+### Transfer consumer
+
+- consumes RabbitMQ transfer jobs
+- acquires a Redis processing lock
+- advances transfers through `CREATED -> VALIDATED -> QUEUED -> SIGNING -> SUBMITTED -> PENDING_ON_CHAIN`
+- persists and resumes durable `transaction_attempts`
+
+### Webhook worker
+
+- inserts webhook rows for eligible transfer status changes
+- claims due webhook rows with leases
+- dispatches signed HTTP callbacks
+- retries failures with backoff until `WEBHOOK_MAX_ATTEMPTS`
+
+### Failure isolation and supervision
+
+- The worker supervises the transfer outbox dispatcher, transfer consumer, and webhook worker independently.
+- A failure in one subsystem does not immediately stop the others.
+- Each subsystem restarts with exponential backoff.
+- This improves isolation, but production monitoring should alert on repeated restart loops because the process can remain alive while one subsystem is degraded.
+
+### Graceful shutdown
+
+- The API server uses `APP_SHUTDOWN_TIMEOUT` for HTTP shutdown.
+- The worker waits for supervised subsystems to stop after the root context is cancelled.
+
+## Data Model Summary
+
+- `transfer_requests`: the primary transfer record, including idempotency key, wallet reference, callback URL, amount, status, and optional `tx_hash`.
+- `transfer_status_history`: append-only transfer status transitions.
+- `transaction_attempts`: durable signed payloads, nonce, `transaction_hash`, last error, and submission status for recovery.
+- `transfer_outbox`: pending/retrying/processing/dispatched transfer job publish records.
+- `webhook_deliveries`: per-status delivery rows with payload, delivery status, attempt counters, last error, next attempt time, and lease expiry.
+- `reconciliation_results`: persisted comparison of internal transfer status vs observed blockchain receipt status.
+- `wallets`: source wallets, with duplicate active wallet protection on `(chain, lower(address))`.
+
+## Testing
+
+Current tests focus on high-risk correctness and security paths:
+
+- transfer outbox durability and retry behavior
+- durable transaction attempt recovery after crashes
+- stale-worker attempt update conflicts
+- multi-worker webhook claiming behavior
+- webhook lease-loss handling
+- webhook signing and target validation
+- internal auth middleware behavior
+
+Useful commands:
 
 ```bash
-curl --request GET \
-  --url http://127.0.0.1:8080/api/v1/transfers/9ee80db8-c74f-4faf-9f96-2a6a13ac0b58
+go test ./...
+go test ./internal/modules/transfers
+go test ./internal/modules/webhooks
+go test ./internal/transport/http
 ```
 
-### List transfers
+## Known Limitations / Next Steps
 
-```bash
-curl --request GET \
-  --url 'http://127.0.0.1:8080/api/v1/transfers?limit=20&offset=0'
-```
-
-## Reconciliation API
-
-### Run reconciliation
-
-```bash
-curl --request POST \
-  --url http://127.0.0.1:8080/api/v1/jobs/reconcile \
-  --header 'X-Aegis-Internal-Key: change-me'
-```
-
-Wallet registry and reconciliation endpoints require the configured internal auth header. If `INTERNAL_AUTH_API_KEY` is empty, those routes stay unavailable rather than open.
-
-## Webhook Verification
-
-When `WEBHOOK_SIGNING_SECRET` is configured, outbound webhooks include:
-
-- `X-Aegis-Timestamp`
-- `X-Aegis-Signature`
-
-The signature format is `v1=<hex hmac sha256>` over:
-
-```text
-<timestamp>.<raw request body>
-```
-
-Receivers should:
-
-1. recompute the HMAC with the shared secret
-2. compare signatures in constant time
-3. reject stale timestamps outside their accepted replay window
-
-Webhook response persistence is intentionally capped by `WEBHOOK_RESPONSE_BODY_MAX_BYTES` so Aegis does not store large or overly sensitive upstream response bodies by default.
-
-### List latest mismatches
-
-```bash
-curl --request GET \
-  --url http://127.0.0.1:8080/api/v1/reconciliation/mismatches
-```
-
-## Recommended Next Steps
-
-1. Add a transfer orchestration module with request validation, persistence, and queue publishing.
-2. Introduce an outbox or event log table for reliable webhook and indexing fanout.
-3. Implement worker consumers for transfer submission, confirmation polling, and retry policies.
-4. Add request id propagation, auth, idempotency keys, and API versioning.
-5. Add integration tests with testcontainers or docker-compose-backed CI jobs.
+- The blockchain signer and broadcaster are mocks today. Replacing them with real EVM signing and submission is the largest remaining gap.
+- Reconciliation still uses a placeholder checker and is only exposed through an internal manual route.
+- There is no built-in SQL migration runner.
+- SSRF controls are application-layer and should be backed by egress restrictions.
+- Worker supervision restarts subsystems indefinitely; production deployments should add alerting and health signals for persistent restart loops.

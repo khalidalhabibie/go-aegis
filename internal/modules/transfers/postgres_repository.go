@@ -278,6 +278,25 @@ func (r *PostgresRepository) GetLatestAttempt(ctx context.Context, transferID st
 	return attempt, nil
 }
 
+func (r *PostgresRepository) getAttemptByID(ctx context.Context, attemptID string) (TransactionAttempt, error) {
+	attempt, err := scanAttempt(r.pool.QueryRow(
+		ctx,
+		`SELECT `+attemptSelectColumns+`
+		FROM transaction_attempts
+		WHERE id = $1`,
+		attemptID,
+	))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return TransactionAttempt{}, ErrTransactionAttemptNotFound
+		}
+
+		return TransactionAttempt{}, fmt.Errorf("get transaction attempt by id: %w", err)
+	}
+
+	return attempt, nil
+}
+
 func (r *PostgresRepository) CreateAttempt(ctx context.Context, params CreateAttemptParams) (TransactionAttempt, error) {
 	attempt, err := scanAttempt(r.pool.QueryRow(
 		ctx,
@@ -312,14 +331,25 @@ func (r *PostgresRepository) UpdateAttempt(ctx context.Context, params UpdateAtt
 			last_error = $3,
 			updated_at = NOW()
 		WHERE id = $1
+			AND status = $4
 		RETURNING `+attemptSelectColumns,
 		params.AttemptID,
 		params.Status,
 		params.ErrorMessage,
+		params.ExpectedStatus,
 	))
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return TransactionAttempt{}, ErrTransactionAttemptNotFound
+			current, getErr := r.getAttemptByID(ctx, params.AttemptID)
+			if getErr != nil {
+				return TransactionAttempt{}, getErr
+			}
+
+			return TransactionAttempt{}, AttemptConflictError{
+				AttemptID: current.ID,
+				Expected:  params.ExpectedStatus,
+				Actual:    current.Status,
+			}
 		}
 
 		return TransactionAttempt{}, mapTransferWriteError("update transaction attempt", err)
@@ -553,6 +583,11 @@ func mapTransferWriteError(operation string, err error) error {
 	case "23503":
 		if pgError.ConstraintName == "fk_transfer_requests_source_wallet_id" {
 			return fmt.Errorf("%s: %w", operation, ErrSourceWalletNotFound)
+		}
+	case "23505":
+		switch pgError.ConstraintName {
+		case "idx_transaction_attempts_transfer_request_active_attempt", "uq_transaction_attempts_transaction_hash":
+			return fmt.Errorf("%s: %w", operation, ErrTransactionAttemptConflict)
 		}
 	case "23514":
 		switch pgError.ConstraintName {

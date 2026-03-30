@@ -2,8 +2,11 @@ package webhooks
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+var ErrDeliveryLeaseLost = errors.New("webhook delivery lease lost")
 
 type Repository interface {
 	ScheduleTransferStatusDeliveries(ctx context.Context, maxAttempts int) (int64, error)
@@ -15,6 +18,7 @@ type Repository interface {
 
 type MarkDeliveredParams struct {
 	ID                 string
+	LeaseExpiresAt     time.Time
 	AttemptCount       int
 	ResponseStatusCode int
 	ResponseBody       string
@@ -22,6 +26,7 @@ type MarkDeliveredParams struct {
 
 type MarkRetryParams struct {
 	ID                 string
+	LeaseExpiresAt     time.Time
 	AttemptCount       int
 	ResponseStatusCode int
 	ResponseBody       string
@@ -31,6 +36,7 @@ type MarkRetryParams struct {
 
 type MarkFailedParams struct {
 	ID                 string
+	LeaseExpiresAt     time.Time
 	AttemptCount       int
 	ResponseStatusCode int
 	ResponseBody       string

@@ -150,6 +150,10 @@ func (p *Processor) createAttemptAndSubmit(ctx context.Context, transfer Transfe
 		Status:     AttemptStatusSigned,
 	})
 	if err != nil {
+		if errors.Is(err, ErrTransactionAttemptConflict) {
+			return p.resumeLatestAttempt(ctx, transfer)
+		}
+
 		return Transfer{}, err
 	}
 
@@ -173,10 +177,15 @@ func (p *Processor) resumeSubmission(ctx context.Context, transfer Transfer, att
 	switch attempt.Status {
 	case AttemptStatusSigned:
 		updatedAttempt, err := p.repository.UpdateAttempt(ctx, UpdateAttemptParams{
-			AttemptID: attempt.ID,
-			Status:    AttemptStatusBroadcasting,
+			AttemptID:      attempt.ID,
+			ExpectedStatus: AttemptStatusSigned,
+			Status:         AttemptStatusBroadcasting,
 		})
 		if err != nil {
+			if errors.Is(err, ErrTransactionAttemptConflict) {
+				return p.resumeLatestAttempt(ctx, transfer)
+			}
+
 			return Transfer{}, err
 		}
 
@@ -209,10 +218,15 @@ func (p *Processor) broadcastAttempt(ctx context.Context, transfer Transfer, att
 		}
 
 		if _, updateErr := p.repository.UpdateAttempt(ctx, UpdateAttemptParams{
-			AttemptID:    attempt.ID,
-			Status:       nextStatus,
-			ErrorMessage: err.Error(),
+			AttemptID:      attempt.ID,
+			ExpectedStatus: AttemptStatusBroadcasting,
+			Status:         nextStatus,
+			ErrorMessage:   err.Error(),
 		}); updateErr != nil {
+			if errors.Is(updateErr, ErrTransactionAttemptConflict) {
+				return p.resumeLatestAttempt(ctx, transfer)
+			}
+
 			return Transfer{}, updateErr
 		}
 
@@ -220,10 +234,15 @@ func (p *Processor) broadcastAttempt(ctx context.Context, transfer Transfer, att
 	}
 
 	broadcastedAttempt, err := p.repository.UpdateAttempt(ctx, UpdateAttemptParams{
-		AttemptID: attempt.ID,
-		Status:    AttemptStatusBroadcasted,
+		AttemptID:      attempt.ID,
+		ExpectedStatus: AttemptStatusBroadcasting,
+		Status:         AttemptStatusBroadcasted,
 	})
 	if err != nil {
+		if errors.Is(err, ErrTransactionAttemptConflict) {
+			return p.resumeLatestAttempt(ctx, transfer)
+		}
+
 		return Transfer{}, err
 	}
 
@@ -236,6 +255,15 @@ func (p *Processor) submitBroadcastedAttempt(ctx context.Context, transfer Trans
 	}
 
 	return p.transition(ctx, transfer, StatusSubmitted, &attempt.TxHash)
+}
+
+func (p *Processor) resumeLatestAttempt(ctx context.Context, transfer Transfer) (Transfer, error) {
+	latestAttempt, err := p.repository.GetLatestAttempt(ctx, transfer.ID)
+	if err != nil {
+		return Transfer{}, err
+	}
+
+	return p.resumeSubmission(ctx, transfer, latestAttempt)
 }
 
 func (p *Processor) transition(ctx context.Context, transfer Transfer, toStatus string, txHash *string) (Transfer, error) {

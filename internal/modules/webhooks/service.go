@@ -2,6 +2,7 @@ package webhooks
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -79,16 +80,29 @@ func (s *Service) RunCycle(ctx context.Context) error {
 }
 
 func (s *Service) processDelivery(ctx context.Context, delivery Delivery) error {
+	if delivery.LeaseExpiresAt == nil {
+		return fmt.Errorf("claimed delivery %s is missing lease expiry", delivery.ID)
+	}
+
 	attempt := delivery.AttemptCount + 1
 
 	result, err := s.dispatcher.Dispatch(ctx, delivery)
 	if err == nil && result.StatusCode >= http.StatusOK && result.StatusCode < http.StatusMultipleChoices {
 		if err := s.repository.MarkDelivered(ctx, MarkDeliveredParams{
 			ID:                 delivery.ID,
+			LeaseExpiresAt:     *delivery.LeaseExpiresAt,
 			AttemptCount:       attempt,
 			ResponseStatusCode: result.StatusCode,
 			ResponseBody:       result.Body,
 		}); err != nil {
+			if errors.Is(err, ErrDeliveryLeaseLost) {
+				s.log.Warn().
+					Str("delivery_id", delivery.ID).
+					Str("transfer_id", delivery.TransferRequestID).
+					Msg("webhook delivery lease expired before delivered state could be persisted")
+				return nil
+			}
+
 			return err
 		}
 
@@ -113,11 +127,20 @@ func (s *Service) processDelivery(ctx context.Context, delivery Delivery) error 
 	if attempt >= delivery.MaxAttempts {
 		if err := s.repository.MarkFailed(ctx, MarkFailedParams{
 			ID:                 delivery.ID,
+			LeaseExpiresAt:     *delivery.LeaseExpiresAt,
 			AttemptCount:       attempt,
 			ResponseStatusCode: result.StatusCode,
 			ResponseBody:       responseBody,
 			LastError:          lastError,
 		}); err != nil {
+			if errors.Is(err, ErrDeliveryLeaseLost) {
+				s.log.Warn().
+					Str("delivery_id", delivery.ID).
+					Str("transfer_id", delivery.TransferRequestID).
+					Msg("webhook delivery lease expired before failed state could be persisted")
+				return nil
+			}
+
 			return err
 		}
 
@@ -135,12 +158,21 @@ func (s *Service) processDelivery(ctx context.Context, delivery Delivery) error 
 	nextAttemptAt := time.Now().UTC().Add(s.backoffForAttempt(attempt))
 	if err := s.repository.MarkRetry(ctx, MarkRetryParams{
 		ID:                 delivery.ID,
+		LeaseExpiresAt:     *delivery.LeaseExpiresAt,
 		AttemptCount:       attempt,
 		ResponseStatusCode: result.StatusCode,
 		ResponseBody:       responseBody,
 		LastError:          lastError,
 		NextAttemptAt:      nextAttemptAt,
 	}); err != nil {
+		if errors.Is(err, ErrDeliveryLeaseLost) {
+			s.log.Warn().
+				Str("delivery_id", delivery.ID).
+				Str("transfer_id", delivery.TransferRequestID).
+				Msg("webhook delivery lease expired before retry state could be persisted")
+			return nil
+		}
+
 		return err
 	}
 

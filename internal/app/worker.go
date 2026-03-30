@@ -59,9 +59,23 @@ func RunWorker(ctx context.Context) error {
 		container.Logger,
 	)
 	webhookRepository := webhooks.NewPostgresRepository(container.Postgres)
+	webhookLeaseDuration := cfg.Webhook.LeaseDuration
+	minimumWebhookLeaseDuration := cfg.Webhook.Timeout + 5*time.Second
+	if webhookLeaseDuration < minimumWebhookLeaseDuration {
+		container.Logger.Warn().
+			Dur("configured_lease_duration", webhookLeaseDuration).
+			Dur("effective_lease_duration", minimumWebhookLeaseDuration).
+			Dur("webhook_timeout", cfg.Webhook.Timeout).
+			Msg("webhook lease duration shorter than dispatch timeout; using safer effective lease duration")
+		webhookLeaseDuration = minimumWebhookLeaseDuration
+	}
 	webhookDispatcher := webhooks.NewHTTPDispatcher(
 		cfg.Webhook.Timeout,
 		webhooks.NewSigner(cfg.Webhook.SigningSecret),
+		webhooks.TargetPolicy{
+			AllowedHosts:        cfg.CallbackURL.AllowedHosts,
+			AllowPrivateTargets: cfg.CallbackURL.AllowPrivateTargets,
+		},
 		cfg.Webhook.ResponseBodyMaxBytes,
 	)
 	webhookService := webhooks.NewService(
@@ -70,7 +84,7 @@ func RunWorker(ctx context.Context) error {
 		cfg.Webhook.MaxAttempts,
 		cfg.Webhook.InitialBackoff,
 		cfg.Webhook.BatchSize,
-		cfg.Webhook.LeaseDuration,
+		webhookLeaseDuration,
 		container.Logger,
 	)
 

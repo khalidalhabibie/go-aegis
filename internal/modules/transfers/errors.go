@@ -8,6 +8,7 @@ import (
 var ErrInvalidTransferState = errors.New("invalid transfer state")
 var ErrInvalidTransferStatus = errors.New("invalid transfer status")
 var ErrInvalidTransactionAttemptStatus = errors.New("invalid transaction attempt status")
+var ErrTransactionAttemptConflict = errors.New("transaction attempt conflict")
 var ErrSourceWalletNotFound = errors.New("source wallet not found")
 var ErrTransient = errors.New("transient error")
 var ErrTransactionAttemptNotFound = errors.New("transaction attempt not found")
@@ -24,6 +25,20 @@ func (e InvalidStateError) Error() string {
 
 func (e InvalidStateError) Unwrap() error {
 	return ErrInvalidTransferState
+}
+
+type AttemptConflictError struct {
+	AttemptID string
+	Expected  string
+	Actual    string
+}
+
+func (e AttemptConflictError) Error() string {
+	return fmt.Sprintf("transaction attempt %s expected status %s but got %s", e.AttemptID, e.Expected, e.Actual)
+}
+
+func (e AttemptConflictError) Unwrap() error {
+	return ErrTransactionAttemptConflict
 }
 
 type TransientError struct {

@@ -12,6 +12,7 @@ import (
 )
 
 func TestServiceRunCycleMarksDelivered(t *testing.T) {
+	leaseExpiresAt := time.Now().UTC().Add(30 * time.Second)
 	repo := &stubRepository{
 		scheduleFn: func(context.Context, int) (int64, error) { return 1, nil },
 		claimDueFn: func(context.Context, int, time.Duration) ([]Delivery, error) {
@@ -20,6 +21,7 @@ func TestServiceRunCycleMarksDelivered(t *testing.T) {
 				TransferRequestID: "transfer-1",
 				TransferStatus:    "SUBMITTED",
 				MaxAttempts:       5,
+				LeaseExpiresAt:    &leaseExpiresAt,
 			}}, nil
 		},
 	}
@@ -42,6 +44,7 @@ func TestServiceRunCycleMarksDelivered(t *testing.T) {
 }
 
 func TestServiceRunCycleSchedulesRetry(t *testing.T) {
+	leaseExpiresAt := time.Now().UTC().Add(30 * time.Second)
 	repo := &stubRepository{
 		scheduleFn: func(context.Context, int) (int64, error) { return 0, nil },
 		claimDueFn: func(context.Context, int, time.Duration) ([]Delivery, error) {
@@ -50,6 +53,7 @@ func TestServiceRunCycleSchedulesRetry(t *testing.T) {
 				TransferRequestID: "transfer-2",
 				TransferStatus:    "FAILED",
 				MaxAttempts:       5,
+				LeaseExpiresAt:    &leaseExpiresAt,
 			}}, nil
 		},
 	}
@@ -71,6 +75,7 @@ func TestServiceRunCycleSchedulesRetry(t *testing.T) {
 func TestServiceRunCycleClaimsDeliveryOnceAcrossConcurrentWorkers(t *testing.T) {
 	var mu sync.Mutex
 	claimed := false
+	leaseExpiresAt := time.Now().UTC().Add(30 * time.Second)
 
 	repo := &stubRepository{
 		scheduleFn: func(context.Context, int) (int64, error) { return 0, nil },
@@ -89,6 +94,7 @@ func TestServiceRunCycleClaimsDeliveryOnceAcrossConcurrentWorkers(t *testing.T) 
 				TransferRequestID: "transfer-3",
 				TransferStatus:    "SUBMITTED",
 				MaxAttempts:       5,
+				LeaseExpiresAt:    &leaseExpiresAt,
 			}}, nil
 		},
 	}
@@ -121,12 +127,45 @@ func TestServiceRunCycleClaimsDeliveryOnceAcrossConcurrentWorkers(t *testing.T) 
 	}
 }
 
+func TestServiceRunCycleIgnoresLeaseLossDuringPersist(t *testing.T) {
+	leaseExpiresAt := time.Now().UTC().Add(30 * time.Second)
+	repo := &stubRepository{
+		scheduleFn: func(context.Context, int) (int64, error) { return 0, nil },
+		claimDueFn: func(context.Context, int, time.Duration) ([]Delivery, error) {
+			return []Delivery{{
+				ID:                "delivery-4",
+				TransferRequestID: "transfer-4",
+				TransferStatus:    "SUBMITTED",
+				MaxAttempts:       5,
+				LeaseExpiresAt:    &leaseExpiresAt,
+			}}, nil
+		},
+		markDeliveredErr: ErrDeliveryLeaseLost,
+	}
+
+	dispatcher := &stubDispatcher{
+		result: DispatchResult{
+			StatusCode: 200,
+			Body:       "ok",
+		},
+	}
+
+	service := NewService(repo, dispatcher, 5, time.Second, 10, 30*time.Second, zerolog.Nop())
+
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}
+
 type stubRepository struct {
-	scheduleFn func(ctx context.Context, maxAttempts int) (int64, error)
-	claimDueFn func(ctx context.Context, limit int, leaseDuration time.Duration) ([]Delivery, error)
-	delivered  *MarkDeliveredParams
-	retry      *MarkRetryParams
-	failed     *MarkFailedParams
+	scheduleFn       func(ctx context.Context, maxAttempts int) (int64, error)
+	claimDueFn       func(ctx context.Context, limit int, leaseDuration time.Duration) ([]Delivery, error)
+	delivered        *MarkDeliveredParams
+	retry            *MarkRetryParams
+	failed           *MarkFailedParams
+	markDeliveredErr error
+	markRetryErr     error
+	markFailedErr    error
 }
 
 func (s *stubRepository) ScheduleTransferStatusDeliveries(ctx context.Context, maxAttempts int) (int64, error) {
@@ -146,16 +185,28 @@ func (s *stubRepository) ClaimDueDeliveries(ctx context.Context, limit int, leas
 }
 
 func (s *stubRepository) MarkDelivered(_ context.Context, params MarkDeliveredParams) error {
+	if s.markDeliveredErr != nil {
+		return s.markDeliveredErr
+	}
+
 	s.delivered = &params
 	return nil
 }
 
 func (s *stubRepository) MarkRetry(_ context.Context, params MarkRetryParams) error {
+	if s.markRetryErr != nil {
+		return s.markRetryErr
+	}
+
 	s.retry = &params
 	return nil
 }
 
 func (s *stubRepository) MarkFailed(_ context.Context, params MarkFailedParams) error {
+	if s.markFailedErr != nil {
+		return s.markFailedErr
+	}
+
 	s.failed = &params
 	return nil
 }

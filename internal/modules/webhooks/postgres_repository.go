@@ -159,78 +159,102 @@ func (r *PostgresRepository) ClaimDueDeliveries(ctx context.Context, limit int, 
 }
 
 func (r *PostgresRepository) MarkDelivered(ctx context.Context, params MarkDeliveredParams) error {
-	if _, err := r.pool.Exec(
+	commandTag, err := r.pool.Exec(
 		ctx,
 		`UPDATE webhook_deliveries
 		SET delivery_status = 'DELIVERED',
-			attempt_count = $2,
-			response_status_code = $3,
-			response_body = $4,
+			attempt_count = $3,
+			response_status_code = $4,
+			response_body = $5,
 			last_error = '',
 			next_attempt_at = NULL,
 			lease_expires_at = NULL,
 			delivered_at = NOW(),
 			updated_at = NOW()
-		WHERE id = $1`,
+		WHERE id = $1
+			AND delivery_status = 'IN_PROGRESS'
+			AND lease_expires_at = $2`,
 		params.ID,
+		params.LeaseExpiresAt,
 		params.AttemptCount,
 		params.ResponseStatusCode,
 		params.ResponseBody,
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("mark webhook delivered: %w", err)
+	}
+
+	if commandTag.RowsAffected() == 0 {
+		return ErrDeliveryLeaseLost
 	}
 
 	return nil
 }
 
 func (r *PostgresRepository) MarkRetry(ctx context.Context, params MarkRetryParams) error {
-	if _, err := r.pool.Exec(
+	commandTag, err := r.pool.Exec(
 		ctx,
 		`UPDATE webhook_deliveries
 		SET delivery_status = 'RETRYING',
-			attempt_count = $2,
-			response_status_code = NULLIF($3, 0),
-			response_body = $4,
-			last_error = $5,
-			next_attempt_at = $6,
+			attempt_count = $3,
+			response_status_code = NULLIF($4, 0),
+			response_body = $5,
+			last_error = $6,
+			next_attempt_at = $7,
 			lease_expires_at = NULL,
 			delivered_at = NULL,
 			updated_at = NOW()
-		WHERE id = $1`,
+		WHERE id = $1
+			AND delivery_status = 'IN_PROGRESS'
+			AND lease_expires_at = $2`,
 		params.ID,
+		params.LeaseExpiresAt,
 		params.AttemptCount,
 		params.ResponseStatusCode,
 		params.ResponseBody,
 		params.LastError,
 		params.NextAttemptAt,
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("mark webhook retry: %w", err)
+	}
+
+	if commandTag.RowsAffected() == 0 {
+		return ErrDeliveryLeaseLost
 	}
 
 	return nil
 }
 
 func (r *PostgresRepository) MarkFailed(ctx context.Context, params MarkFailedParams) error {
-	if _, err := r.pool.Exec(
+	commandTag, err := r.pool.Exec(
 		ctx,
 		`UPDATE webhook_deliveries
 		SET delivery_status = 'FAILED',
-			attempt_count = $2,
-			response_status_code = NULLIF($3, 0),
-			response_body = $4,
-			last_error = $5,
+			attempt_count = $3,
+			response_status_code = NULLIF($4, 0),
+			response_body = $5,
+			last_error = $6,
 			next_attempt_at = NULL,
 			lease_expires_at = NULL,
 			delivered_at = NULL,
 			updated_at = NOW()
-		WHERE id = $1`,
+		WHERE id = $1
+			AND delivery_status = 'IN_PROGRESS'
+			AND lease_expires_at = $2`,
 		params.ID,
+		params.LeaseExpiresAt,
 		params.AttemptCount,
 		params.ResponseStatusCode,
 		params.ResponseBody,
 		params.LastError,
-	); err != nil {
+	)
+	if err != nil {
 		return fmt.Errorf("mark webhook failed: %w", err)
+	}
+
+	if commandTag.RowsAffected() == 0 {
+		return ErrDeliveryLeaseLost
 	}
 
 	return nil

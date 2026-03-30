@@ -187,26 +187,97 @@ func TestProcessorRecoversAfterCrashFollowingBroadcast(t *testing.T) {
 	}
 }
 
+func TestProcessorRecoversWhenConcurrentWorkerAlreadyCreatedAttempt(t *testing.T) {
+	repo := &conflictingAttemptRepository{
+		transfer: Transfer{
+			ID:     "transfer-6",
+			Status: StatusSigning,
+		},
+		existingAttempt: TransactionAttempt{
+			ID:         "attempt-6",
+			TransferID: "transfer-6",
+			RawPayload: mustAttemptPayload(t, "signed-existing"),
+			TxHash:     "0xexisting",
+			Status:     AttemptStatusBroadcasted,
+		},
+	}
+
+	processor := NewProcessor(
+		repo,
+		&stubSigner{signed: SignedTransfer{RawTransaction: "signed-new", TxHash: "0xnew"}},
+		&stubBroadcaster{},
+		zerolog.Nop(),
+	)
+
+	transfer, err := processor.ProcessTransfer(context.Background(), "transfer-6")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if transfer.Status != StatusPendingOnChain {
+		t.Fatalf("expected status %q, got %q", StatusPendingOnChain, transfer.Status)
+	}
+
+	if repo.createAttemptCalls != 1 {
+		t.Fatalf("expected one create attempt call, got %d", repo.createAttemptCalls)
+	}
+}
+
+func TestProcessorRecoversWhenAttemptUpdateLosesRace(t *testing.T) {
+	repo := newInMemoryRepository(Transfer{
+		ID:     "transfer-7",
+		Status: StatusSigning,
+	})
+	repo.attempt = &TransactionAttempt{
+		ID:         "attempt-7",
+		TransferID: "transfer-7",
+		RawPayload: mustAttemptPayload(t, "signed-existing"),
+		TxHash:     "0xrace",
+		Status:     AttemptStatusSigned,
+	}
+	repo.conflictOnAttemptUpdate = true
+	repo.conflictReplacementAttempt = &TransactionAttempt{
+		ID:         "attempt-7",
+		TransferID: "transfer-7",
+		RawPayload: mustAttemptPayload(t, "signed-existing"),
+		TxHash:     "0xrace",
+		Status:     AttemptStatusBroadcasted,
+	}
+
+	processor := NewProcessor(repo, &stubSigner{}, &stubBroadcaster{}, zerolog.Nop())
+
+	transfer, err := processor.ProcessTransfer(context.Background(), "transfer-7")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if transfer.Status != StatusPendingOnChain {
+		t.Fatalf("expected status %q, got %q", StatusPendingOnChain, transfer.Status)
+	}
+}
+
 func TestProcessorRejectsInvalidStatusTransition(t *testing.T) {
 	repo := newInMemoryRepository(Transfer{
-		ID:     "transfer-6",
+		ID:     "transfer-8",
 		Status: "UNKNOWN_STATUS",
 	})
 
 	processor := NewProcessor(repo, &stubSigner{}, &stubBroadcaster{}, zerolog.Nop())
 
-	_, err := processor.ProcessTransfer(context.Background(), "transfer-6")
+	_, err := processor.ProcessTransfer(context.Background(), "transfer-8")
 	if !errors.Is(err, ErrInvalidTransferState) {
 		t.Fatalf("expected invalid transfer state error, got %v", err)
 	}
 }
 
 type inMemoryRepository struct {
-	transfer              Transfer
-	attempt               *TransactionAttempt
-	transitions           []string
-	transitionErrorStatus string
-	transitionError       error
+	transfer                   Transfer
+	attempt                    *TransactionAttempt
+	transitions                []string
+	transitionErrorStatus      string
+	transitionError            error
+	conflictOnAttemptUpdate    bool
+	conflictReplacementAttempt *TransactionAttempt
 }
 
 func newInMemoryRepository(transfer Transfer) *inMemoryRepository {
@@ -283,10 +354,92 @@ func (r *inMemoryRepository) UpdateAttempt(_ context.Context, params UpdateAttem
 		return TransactionAttempt{}, ErrTransactionAttemptNotFound
 	}
 
+	if params.ExpectedStatus != "" && r.attempt.Status != params.ExpectedStatus {
+		return TransactionAttempt{}, AttemptConflictError{
+			AttemptID: r.attempt.ID,
+			Expected:  params.ExpectedStatus,
+			Actual:    r.attempt.Status,
+		}
+	}
+
+	if r.conflictOnAttemptUpdate {
+		r.conflictOnAttemptUpdate = false
+		if r.conflictReplacementAttempt != nil {
+			updated := *r.conflictReplacementAttempt
+			r.attempt = &updated
+		}
+
+		return TransactionAttempt{}, AttemptConflictError{
+			AttemptID: params.AttemptID,
+			Expected:  params.ExpectedStatus,
+			Actual:    r.attempt.Status,
+		}
+	}
+
 	r.attempt.Status = params.Status
 	r.attempt.ErrorMessage = params.ErrorMessage
 
 	return *r.attempt, nil
+}
+
+type conflictingAttemptRepository struct {
+	transfer           Transfer
+	existingAttempt    TransactionAttempt
+	createAttemptCalls int
+}
+
+func (r *conflictingAttemptRepository) Create(context.Context, CreateParams) (Transfer, bool, error) {
+	return r.transfer, true, nil
+}
+
+func (r *conflictingAttemptRepository) GetByID(_ context.Context, id string) (Transfer, error) {
+	if id != r.transfer.ID {
+		return Transfer{}, ErrTransferNotFound
+	}
+
+	return r.transfer, nil
+}
+
+func (r *conflictingAttemptRepository) List(context.Context, ListParams) ([]Transfer, error) {
+	return []Transfer{r.transfer}, nil
+}
+
+func (r *conflictingAttemptRepository) TransitionStatus(_ context.Context, params TransitionParams) (Transfer, error) {
+	if r.transfer.Status != params.FromStatus {
+		return Transfer{}, InvalidStateError{
+			TransferID: r.transfer.ID,
+			Expected:   params.FromStatus,
+			Actual:     r.transfer.Status,
+		}
+	}
+
+	r.transfer.Status = params.ToStatus
+	if params.TxHash != nil {
+		r.transfer.TxHash = *params.TxHash
+	}
+
+	return r.transfer, nil
+}
+
+func (r *conflictingAttemptRepository) GetLatestAttempt(_ context.Context, transferID string) (TransactionAttempt, error) {
+	if transferID != r.transfer.ID {
+		return TransactionAttempt{}, ErrTransactionAttemptNotFound
+	}
+
+	if r.createAttemptCalls == 0 {
+		return TransactionAttempt{}, ErrTransactionAttemptNotFound
+	}
+
+	return r.existingAttempt, nil
+}
+
+func (r *conflictingAttemptRepository) CreateAttempt(context.Context, CreateAttemptParams) (TransactionAttempt, error) {
+	r.createAttemptCalls++
+	return TransactionAttempt{}, ErrTransactionAttemptConflict
+}
+
+func (r *conflictingAttemptRepository) UpdateAttempt(context.Context, UpdateAttemptParams) (TransactionAttempt, error) {
+	return TransactionAttempt{}, ErrTransactionAttemptNotFound
 }
 
 type stubSigner struct {
@@ -313,11 +466,7 @@ func (b *stubBroadcaster) BroadcastTransfer(_ context.Context, _ Transfer, attem
 }
 
 func TestAttemptPayloadRoundTrip(t *testing.T) {
-	rawPayload, err := newTransactionAttemptPayload("signed-round-trip")
-	if err != nil {
-		t.Fatalf("marshal attempt payload: %v", err)
-	}
-
+	rawPayload := mustAttemptPayload(t, "signed-round-trip")
 	attempt := TransactionAttempt{RawPayload: rawPayload}
 	payload, err := attempt.Payload()
 	if err != nil {
@@ -335,4 +484,15 @@ func TestAttemptPayloadRoundTrip(t *testing.T) {
 	if !json.Valid(rawPayload) {
 		t.Fatalf("expected valid json payload, got %s", rawPayload)
 	}
+}
+
+func mustAttemptPayload(t *testing.T, rawTransaction string) json.RawMessage {
+	t.Helper()
+
+	rawPayload, err := newTransactionAttemptPayload(rawTransaction)
+	if err != nil {
+		t.Fatalf("marshal attempt payload: %v", err)
+	}
+
+	return rawPayload
 }

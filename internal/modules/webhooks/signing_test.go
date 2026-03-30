@@ -3,6 +3,7 @@ package webhooks
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -42,8 +43,11 @@ func TestHTTPDispatcherAddsDeterministicSignedHeaders(t *testing.T) {
 		PayloadJSON:    []byte(`{"transfer_id":"t-1","status":"SUBMITTED"}`),
 	}
 
-	dispatcher := NewHTTPDispatcher(5*time.Second, NewSigner("super-secret"), 64)
+	dispatcher := NewHTTPDispatcher(5*time.Second, NewSigner("super-secret"), TargetPolicy{}, 64)
 	dispatcher.now = func() time.Time { return fixedTime }
+	dispatcher.lookupIPAddrs = func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+	}
 	dispatcher.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if got := r.Header.Get(TimestampHeaderName); got != "2026-03-30T12:00:00Z" {
 			t.Fatalf("unexpected timestamp header %q", got)
@@ -72,6 +76,58 @@ func TestHTTPDispatcherAddsDeterministicSignedHeaders(t *testing.T) {
 
 	if result.StatusCode != http.StatusOK {
 		t.Fatalf("expected status %d, got %d", http.StatusOK, result.StatusCode)
+	}
+}
+
+func TestHTTPDispatcherRejectsResolvedPrivateTargets(t *testing.T) {
+	dispatcher := NewHTTPDispatcher(5*time.Second, nil, TargetPolicy{}, 64)
+	dispatcher.lookupIPAddrs = func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("10.0.0.12")}}, nil
+	}
+
+	_, err := dispatcher.Dispatch(context.Background(), Delivery{
+		ID:          "delivery-private",
+		TargetURL:   "https://hooks.example.com/webhooks",
+		PayloadJSON: []byte(`{"ok":true}`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "disallowed IP") {
+		t.Fatalf("expected private target rejection, got %v", err)
+	}
+}
+
+func TestHTTPDispatcherRejectsRedirectToPrivateTarget(t *testing.T) {
+	dispatcher := NewHTTPDispatcher(5*time.Second, nil, TargetPolicy{}, 64)
+	dispatcher.lookupIPAddrs = func(_ context.Context, host string) ([]net.IPAddr, error) {
+		switch host {
+		case "hooks.example.com":
+			return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+		case "internal.example.local":
+			return []net.IPAddr{{IP: net.ParseIP("10.0.0.44")}}, nil
+		default:
+			return nil, nil
+		}
+	}
+	dispatcher.client.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "hooks.example.com" {
+			t.Fatalf("unexpected initial request host %q", r.URL.Host)
+		}
+
+		return &http.Response{
+			StatusCode: http.StatusTemporaryRedirect,
+			Header: http.Header{
+				"Location": []string{"https://internal.example.local/webhooks"},
+			},
+			Body: io.NopCloser(strings.NewReader("redirect")),
+		}, nil
+	})
+
+	_, err := dispatcher.Dispatch(context.Background(), Delivery{
+		ID:          "delivery-redirect",
+		TargetURL:   "https://hooks.example.com/webhooks",
+		PayloadJSON: []byte(`{"ok":true}`),
+	})
+	if err == nil || !strings.Contains(err.Error(), "validate redirect target") {
+		t.Fatalf("expected redirect validation failure, got %v", err)
 	}
 }
 
