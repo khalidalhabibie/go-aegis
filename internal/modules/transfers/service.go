@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"net/url"
 	"strings"
 
@@ -34,8 +35,14 @@ func (e ValidationError) Unwrap() error {
 }
 
 type Service struct {
-	repository Repository
-	log        zerolog.Logger
+	repository        Repository
+	callbackURLPolicy CallbackURLPolicy
+	log               zerolog.Logger
+}
+
+type CallbackURLPolicy struct {
+	AllowedHosts        []string
+	AllowPrivateTargets bool
 }
 
 type CreateInput struct {
@@ -60,15 +67,16 @@ type ListResult struct {
 	Offset int
 }
 
-func NewService(repository Repository, log zerolog.Logger) *Service {
+func NewService(repository Repository, callbackURLPolicy CallbackURLPolicy, log zerolog.Logger) *Service {
 	return &Service{
-		repository: repository,
-		log:        log,
+		repository:        repository,
+		callbackURLPolicy: callbackURLPolicy,
+		log:               log,
 	}
 }
 
 func (s *Service) CreateTransfer(ctx context.Context, input CreateInput) (Transfer, bool, error) {
-	params, err := normalizeCreateInput(input)
+	params, err := normalizeCreateInput(input, s.callbackURLPolicy)
 	if err != nil {
 		return Transfer{}, false, err
 	}
@@ -130,7 +138,7 @@ func (s *Service) ListTransfers(ctx context.Context, input ListInput) (ListResul
 	}, nil
 }
 
-func normalizeCreateInput(input CreateInput) (CreateParams, error) {
+func normalizeCreateInput(input CreateInput, callbackURLPolicy CallbackURLPolicy) (CreateParams, error) {
 	params := CreateParams{
 		IdempotencyKey:     strings.TrimSpace(input.IdempotencyKey),
 		Chain:              strings.TrimSpace(input.Chain),
@@ -185,6 +193,14 @@ func normalizeCreateInput(input CreateInput) (CreateParams, error) {
 		if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
 			return CreateParams{}, ValidationError{Field: "callback_url", Message: "must use http or https"}
 		}
+
+		if parsedURL.User != nil {
+			return CreateParams{}, ValidationError{Field: "callback_url", Message: "must not include user credentials"}
+		}
+
+		if err := validateCallbackURLTarget(parsedURL, callbackURLPolicy); err != nil {
+			return CreateParams{}, err
+		}
 	}
 
 	if len(params.MetadataJSON) == 0 {
@@ -208,4 +224,69 @@ func normalizeCreateInput(input CreateInput) (CreateParams, error) {
 	params.MetadataJSON = normalizedMetadata
 
 	return params, nil
+}
+
+func validateCallbackURLTarget(parsedURL *url.URL, policy CallbackURLPolicy) error {
+	hostname := normalizeHostname(parsedURL.Hostname())
+	if hostname == "" {
+		return ValidationError{Field: "callback_url", Message: "must include a valid hostname"}
+	}
+
+	if len(policy.AllowedHosts) > 0 && !isAllowedCallbackHost(hostname, policy.AllowedHosts) {
+		return ValidationError{Field: "callback_url", Message: "host is not in the allowed callback host list"}
+	}
+
+	if policy.AllowPrivateTargets {
+		return nil
+	}
+
+	if isLocalOrPrivateCallbackHost(hostname) {
+		return ValidationError{Field: "callback_url", Message: "must not target localhost or private network addresses"}
+	}
+
+	return nil
+}
+
+func isAllowedCallbackHost(hostname string, allowedHosts []string) bool {
+	normalizedHost := normalizeHostname(hostname)
+	for _, candidate := range allowedHosts {
+		allowed := normalizeHostname(candidate)
+		if allowed == "" {
+			continue
+		}
+
+		if normalizedHost == allowed || strings.HasSuffix(normalizedHost, "."+allowed) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isLocalOrPrivateCallbackHost(hostname string) bool {
+	normalizedHost := normalizeHostname(hostname)
+	switch {
+	case normalizedHost == "localhost":
+		return true
+	case strings.HasSuffix(normalizedHost, ".localhost"),
+		strings.HasSuffix(normalizedHost, ".local"),
+		strings.HasSuffix(normalizedHost, ".internal"):
+		return true
+	}
+
+	ip := net.ParseIP(normalizedHost)
+	if ip == nil {
+		return false
+	}
+
+	return ip.IsLoopback() ||
+		ip.IsPrivate() ||
+		ip.IsLinkLocalMulticast() ||
+		ip.IsLinkLocalUnicast() ||
+		ip.IsMulticast() ||
+		ip.IsUnspecified()
+}
+
+func normalizeHostname(hostname string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(hostname)), ".")
 }

@@ -59,7 +59,11 @@ func RunWorker(ctx context.Context) error {
 		container.Logger,
 	)
 	webhookRepository := webhooks.NewPostgresRepository(container.Postgres)
-	webhookDispatcher := webhooks.NewHTTPDispatcher(cfg.Webhook.Timeout)
+	webhookDispatcher := webhooks.NewHTTPDispatcher(
+		cfg.Webhook.Timeout,
+		webhooks.NewSigner(cfg.Webhook.SigningSecret),
+		cfg.Webhook.ResponseBodyMaxBytes,
+	)
 	webhookService := webhooks.NewService(
 		webhookRepository,
 		webhookDispatcher,

@@ -14,12 +14,16 @@ type Dispatcher interface {
 }
 
 type HTTPDispatcher struct {
-	client *http.Client
+	client               *http.Client
+	signer               *Signer
+	responseBodyMaxBytes int
 }
 
-func NewHTTPDispatcher(timeout time.Duration) *HTTPDispatcher {
+func NewHTTPDispatcher(timeout time.Duration, signer *Signer, responseBodyMaxBytes int) *HTTPDispatcher {
 	return &HTTPDispatcher{
-		client: &http.Client{Timeout: timeout},
+		client:               &http.Client{Timeout: timeout},
+		signer:               signer,
+		responseBodyMaxBytes: responseBodyMaxBytes,
 	}
 }
 
@@ -34,19 +38,30 @@ func (d *HTTPDispatcher) Dispatch(ctx context.Context, delivery Delivery) (Dispa
 	request.Header.Set("X-Aegis-Transfer-Status", delivery.TransferStatus)
 	request.Header.Set("X-Aegis-Delivery-ID", delivery.ID)
 
+	if d.signer != nil {
+		timestamp, signature := d.signer.Sign(delivery.PayloadJSON, time.Now())
+		request.Header.Set(TimestampHeaderName, timestamp)
+		request.Header.Set(SignatureHeaderName, signature)
+	}
+
 	response, err := d.client.Do(request)
 	if err != nil {
 		return DispatchResult{}, fmt.Errorf("send webhook request: %w", err)
 	}
 	defer response.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(response.Body, 4096))
+	maxBytes := d.responseBodyMaxBytes
+	if maxBytes <= 0 {
+		maxBytes = 512
+	}
+
+	body, err := io.ReadAll(io.LimitReader(response.Body, int64(maxBytes+1)))
 	if err != nil {
 		return DispatchResult{}, fmt.Errorf("read webhook response body: %w", err)
 	}
 
 	return DispatchResult{
 		StatusCode: response.StatusCode,
-		Body:       string(body),
+		Body:       sanitizeResponseBody(body, maxBytes),
 	}, nil
 }
