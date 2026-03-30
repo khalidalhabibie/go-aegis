@@ -143,10 +143,70 @@ func TestProcessorRecoversFromBroadcastedAttemptWithoutRebroadcast(t *testing.T)
 	}
 }
 
+func TestProcessorRecoversAfterCrashFollowingBroadcast(t *testing.T) {
+	repo := newInMemoryRepository(Transfer{
+		ID:     "transfer-5",
+		Status: StatusSigning,
+	})
+	repo.transitionErrorStatus = StatusSubmitted
+	repo.transitionError = errors.New("persist submitted status")
+
+	signer := &stubSigner{signed: SignedTransfer{RawTransaction: "signed-payload", TxHash: "0xcrash"}}
+	broadcaster := &stubBroadcaster{}
+	processor := NewProcessor(repo, signer, broadcaster, zerolog.Nop())
+
+	_, err := processor.ProcessTransfer(context.Background(), "transfer-5")
+	if err == nil {
+		t.Fatal("expected first run to fail")
+	}
+
+	if broadcaster.calls != 1 {
+		t.Fatalf("expected exactly one broadcast attempt before crash, got %d", broadcaster.calls)
+	}
+
+	if repo.attempt == nil || repo.attempt.Status != AttemptStatusBroadcasted {
+		t.Fatalf("expected durable attempt to remain BROADCASTED, got %+v", repo.attempt)
+	}
+
+	if repo.transfer.Status != StatusSigning {
+		t.Fatalf("expected transfer to remain in SIGNING after simulated crash, got %q", repo.transfer.Status)
+	}
+
+	repo.transitionError = nil
+	transfer, err := processor.ProcessTransfer(context.Background(), "transfer-5")
+	if err != nil {
+		t.Fatalf("expected recovery run to succeed, got %v", err)
+	}
+
+	if broadcaster.calls != 1 {
+		t.Fatalf("expected recovery to avoid rebroadcast, got %d broadcasts", broadcaster.calls)
+	}
+
+	if transfer.Status != StatusPendingOnChain {
+		t.Fatalf("expected recovered transfer to reach %q, got %q", StatusPendingOnChain, transfer.Status)
+	}
+}
+
+func TestProcessorRejectsInvalidStatusTransition(t *testing.T) {
+	repo := newInMemoryRepository(Transfer{
+		ID:     "transfer-6",
+		Status: "UNKNOWN_STATUS",
+	})
+
+	processor := NewProcessor(repo, &stubSigner{}, &stubBroadcaster{}, zerolog.Nop())
+
+	_, err := processor.ProcessTransfer(context.Background(), "transfer-6")
+	if !errors.Is(err, ErrInvalidTransferState) {
+		t.Fatalf("expected invalid transfer state error, got %v", err)
+	}
+}
+
 type inMemoryRepository struct {
-	transfer    Transfer
-	attempt     *TransactionAttempt
-	transitions []string
+	transfer              Transfer
+	attempt               *TransactionAttempt
+	transitions           []string
+	transitionErrorStatus string
+	transitionError       error
 }
 
 func newInMemoryRepository(transfer Transfer) *inMemoryRepository {
@@ -180,6 +240,10 @@ func (r *inMemoryRepository) TransitionStatus(_ context.Context, params Transiti
 			Expected:   params.FromStatus,
 			Actual:     r.transfer.Status,
 		}
+	}
+
+	if r.transitionError != nil && params.ToStatus == r.transitionErrorStatus {
+		return Transfer{}, r.transitionError
 	}
 
 	r.transfer.Status = params.ToStatus
