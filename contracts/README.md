@@ -33,8 +33,8 @@ Install dependencies from the `contracts/` directory:
 
 ```bash
 cd contracts
-forge install OpenZeppelin/openzeppelin-contracts --no-commit
-forge install foundry-rs/forge-std --no-commit
+forge install OpenZeppelin/openzeppelin-contracts
+forge install foundry-rs/forge-std
 ```
 
 ## Test

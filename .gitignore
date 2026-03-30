@@ -1,0 +1,37 @@
+# Go
+bin/
+dist/
+coverage.out
+coverage.html
+*.test
+
+# Build caches
+.cache/
+.tmp/
+tmp/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Dependency directories
+vendor/
+
+# Foundry artifacts
+contracts/broadcast/
+contracts/cache/
+contracts/out/
+contracts/lib/
+

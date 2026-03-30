@@ -27,6 +27,18 @@ const transferSelectColumns = `
 	updated_at
 `
 
+const attemptSelectColumns = `
+	id::text,
+	transfer_request_id::text,
+	nonce,
+	raw_payload::text,
+	COALESCE(transaction_hash, ''),
+	status,
+	COALESCE(last_error, ''),
+	created_at,
+	updated_at
+`
+
 type PostgresRepository struct {
 	pool *pgxpool.Pool
 }
@@ -244,6 +256,77 @@ func (r *PostgresRepository) TransitionStatus(ctx context.Context, params Transi
 	return transfer, nil
 }
 
+func (r *PostgresRepository) GetLatestAttempt(ctx context.Context, transferID string) (TransactionAttempt, error) {
+	attempt, err := scanAttempt(r.pool.QueryRow(
+		ctx,
+		`SELECT `+attemptSelectColumns+`
+		FROM transaction_attempts
+		WHERE transfer_request_id = $1
+		ORDER BY created_at DESC
+		LIMIT 1`,
+		transferID,
+	))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return TransactionAttempt{}, ErrTransactionAttemptNotFound
+		}
+
+		return TransactionAttempt{}, fmt.Errorf("get latest transaction attempt: %w", err)
+	}
+
+	return attempt, nil
+}
+
+func (r *PostgresRepository) CreateAttempt(ctx context.Context, params CreateAttemptParams) (TransactionAttempt, error) {
+	attempt, err := scanAttempt(r.pool.QueryRow(
+		ctx,
+		`INSERT INTO transaction_attempts (
+			transfer_request_id,
+			transaction_hash,
+			nonce,
+			status,
+			raw_payload,
+			last_error
+		) VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING `+attemptSelectColumns,
+		params.TransferID,
+		params.TxHash,
+		params.Nonce,
+		params.Status,
+		params.RawPayload,
+		params.ErrorMessage,
+	))
+	if err != nil {
+		return TransactionAttempt{}, fmt.Errorf("create transaction attempt: %w", err)
+	}
+
+	return attempt, nil
+}
+
+func (r *PostgresRepository) UpdateAttempt(ctx context.Context, params UpdateAttemptParams) (TransactionAttempt, error) {
+	attempt, err := scanAttempt(r.pool.QueryRow(
+		ctx,
+		`UPDATE transaction_attempts
+		SET status = $2,
+			last_error = $3,
+			updated_at = NOW()
+		WHERE id = $1
+		RETURNING `+attemptSelectColumns,
+		params.AttemptID,
+		params.Status,
+		params.ErrorMessage,
+	))
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return TransactionAttempt{}, ErrTransactionAttemptNotFound
+		}
+
+		return TransactionAttempt{}, fmt.Errorf("update transaction attempt: %w", err)
+	}
+
+	return attempt, nil
+}
+
 func (r *PostgresRepository) getByIdempotencyKey(ctx context.Context, idempotencyKey string) (Transfer, error) {
 	transfer, err := scanTransfer(r.pool.QueryRow(
 		ctx,
@@ -434,4 +517,27 @@ func scanOutboxEvent(scanner rowScanner) (OutboxEvent, error) {
 	event.PayloadJSON = json.RawMessage(payload)
 
 	return event, nil
+}
+
+func scanAttempt(scanner rowScanner) (TransactionAttempt, error) {
+	var attempt TransactionAttempt
+	var rawPayload string
+
+	if err := scanner.Scan(
+		&attempt.ID,
+		&attempt.TransferID,
+		&attempt.Nonce,
+		&rawPayload,
+		&attempt.TxHash,
+		&attempt.Status,
+		&attempt.ErrorMessage,
+		&attempt.CreatedAt,
+		&attempt.UpdatedAt,
+	); err != nil {
+		return TransactionAttempt{}, err
+	}
+
+	attempt.RawPayload = json.RawMessage(rawPayload)
+
+	return attempt, nil
 }
