@@ -29,8 +29,7 @@ func TestCreateTransferNormalizesInput(t *testing.T) {
 		},
 	}
 
-	publisher := &stubPublisher{}
-	service := NewService(repo, publisher, zerolog.Nop())
+	service := NewService(repo, zerolog.Nop())
 
 	transfer, created, err := service.CreateTransfer(context.Background(), CreateInput{
 		IdempotencyKey:     " idem-1 ",
@@ -53,14 +52,10 @@ func TestCreateTransferNormalizesInput(t *testing.T) {
 	if transfer.IdempotencyKey != "idem-1" {
 		t.Fatalf("expected trimmed idempotency key, got %q", transfer.IdempotencyKey)
 	}
-
-	if len(publisher.jobs) != 1 || publisher.jobs[0].TransferID != transfer.ID {
-		t.Fatalf("expected transfer job to be published, got %+v", publisher.jobs)
-	}
 }
 
 func TestCreateTransferRejectsInvalidAmount(t *testing.T) {
-	service := NewService(&stubRepository{}, nil, zerolog.Nop())
+	service := NewService(&stubRepository{}, zerolog.Nop())
 
 	_, _, err := service.CreateTransfer(context.Background(), CreateInput{
 		IdempotencyKey:     "idem-1",
@@ -94,7 +89,7 @@ func TestListTransfersNormalizesPagination(t *testing.T) {
 		},
 	}
 
-	service := NewService(repo, nil, zerolog.Nop())
+	service := NewService(repo, zerolog.Nop())
 
 	result, err := service.ListTransfers(context.Background(), ListInput{
 		Limit:  150,
@@ -146,18 +141,4 @@ func (s *stubRepository) TransitionStatus(ctx context.Context, params Transition
 	}
 
 	return s.transitionFn(ctx, params)
-}
-
-type stubPublisher struct {
-	jobs []TransferJob
-	err  error
-}
-
-func (s *stubPublisher) PublishTransferRequested(_ context.Context, job TransferJob) error {
-	if s.err != nil {
-		return s.err
-	}
-
-	s.jobs = append(s.jobs, job)
-	return nil
 }

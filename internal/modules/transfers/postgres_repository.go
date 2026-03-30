@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -96,6 +97,31 @@ func (r *PostgresRepository) Create(ctx context.Context, params CreateParams) (T
 		transfer.Status,
 	); err != nil {
 		return Transfer{}, false, fmt.Errorf("insert transfer status history: %w", err)
+	}
+
+	jobPayload, err := json.Marshal(TransferJob{
+		TransferID: transfer.ID,
+		Attempt:    0,
+	})
+	if err != nil {
+		return Transfer{}, false, fmt.Errorf("marshal transfer outbox payload: %w", err)
+	}
+
+	if _, err := tx.Exec(
+		ctx,
+		`INSERT INTO transfer_outbox (
+			transfer_request_id,
+			event_type,
+			payload_json,
+			status,
+			available_at
+		) VALUES ($1, $2, $3, $4, NOW())`,
+		transfer.ID,
+		OutboxEventTypeTransferRequested,
+		jobPayload,
+		OutboxStatusPending,
+	); err != nil {
+		return Transfer{}, false, fmt.Errorf("insert transfer outbox event: %w", err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -235,6 +261,120 @@ func (r *PostgresRepository) getByIdempotencyKey(ctx context.Context, idempotenc
 	return transfer, nil
 }
 
+func (r *PostgresRepository) ClaimPendingOutbox(ctx context.Context, batchSize int, staleBefore time.Time) ([]OutboxEvent, error) {
+	if batchSize <= 0 {
+		batchSize = 25
+	}
+
+	rows, err := r.pool.Query(
+		ctx,
+		`WITH candidates AS (
+			SELECT id
+			FROM transfer_outbox
+			WHERE (
+				status IN ($1, $2)
+				AND available_at <= NOW()
+			) OR (
+				status = $3
+				AND locked_at IS NOT NULL
+				AND locked_at <= $4
+			)
+			ORDER BY available_at ASC, created_at ASC
+			LIMIT $5
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE transfer_outbox AS outbox
+		SET status = $3,
+			locked_at = NOW(),
+			updated_at = NOW()
+		FROM candidates
+		WHERE outbox.id = candidates.id
+		RETURNING
+			outbox.id::text,
+			outbox.transfer_request_id::text,
+			outbox.event_type,
+			outbox.payload_json::text,
+			outbox.status,
+			outbox.attempt_count,
+			outbox.available_at,
+			outbox.locked_at,
+			outbox.dispatched_at,
+			COALESCE(outbox.last_error, ''),
+			outbox.created_at,
+			outbox.updated_at`,
+		OutboxStatusPending,
+		OutboxStatusRetry,
+		OutboxStatusProcessing,
+		staleBefore,
+		batchSize,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("claim pending transfer outbox: %w", err)
+	}
+	defer rows.Close()
+
+	events := make([]OutboxEvent, 0, batchSize)
+	for rows.Next() {
+		event, scanErr := scanOutboxEvent(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("scan claimed transfer outbox event: %w", scanErr)
+		}
+
+		events = append(events, event)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate claimed transfer outbox events: %w", err)
+	}
+
+	return events, nil
+}
+
+func (r *PostgresRepository) MarkOutboxDispatched(ctx context.Context, outboxID string, attemptCount int) error {
+	if _, err := r.pool.Exec(
+		ctx,
+		`UPDATE transfer_outbox
+		SET status = $2,
+			attempt_count = GREATEST(attempt_count, $3),
+			dispatched_at = COALESCE(dispatched_at, NOW()),
+			locked_at = NULL,
+			last_error = NULL,
+			updated_at = NOW()
+		WHERE id = $1 AND status <> $2`,
+		outboxID,
+		OutboxStatusDispatched,
+		attemptCount,
+	); err != nil {
+		return fmt.Errorf("mark transfer outbox dispatched: %w", err)
+	}
+
+	return nil
+}
+
+func (r *PostgresRepository) MarkOutboxRetry(ctx context.Context, outboxID string, attemptCount int, nextAvailableAt time.Time, lastError string) error {
+	if _, err := r.pool.Exec(
+		ctx,
+		`UPDATE transfer_outbox
+		SET status = $2,
+			attempt_count = GREATEST(attempt_count, $3),
+			available_at = $4,
+			locked_at = NULL,
+			last_error = $5,
+			updated_at = NOW()
+		WHERE id = $1 AND status <> $6`,
+		outboxID,
+		OutboxStatusRetry,
+		attemptCount,
+		nextAvailableAt,
+		lastError,
+		OutboxStatusDispatched,
+	); err != nil {
+		return fmt.Errorf("mark transfer outbox retry: %w", err)
+	}
+
+	return nil
+}
+
 type rowScanner interface {
 	Scan(dest ...any) error
 }
@@ -268,4 +408,30 @@ func scanTransfer(scanner rowScanner) (Transfer, error) {
 	}
 
 	return transfer, nil
+}
+
+func scanOutboxEvent(scanner rowScanner) (OutboxEvent, error) {
+	var event OutboxEvent
+	var payload string
+
+	if err := scanner.Scan(
+		&event.ID,
+		&event.TransferID,
+		&event.EventType,
+		&payload,
+		&event.Status,
+		&event.AttemptCount,
+		&event.AvailableAt,
+		&event.LockedAt,
+		&event.DispatchedAt,
+		&event.LastError,
+		&event.CreatedAt,
+		&event.UpdatedAt,
+	); err != nil {
+		return OutboxEvent{}, err
+	}
+
+	event.PayloadJSON = json.RawMessage(payload)
+
+	return event, nil
 }

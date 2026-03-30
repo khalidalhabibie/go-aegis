@@ -17,28 +17,34 @@ type Consumer struct {
 	subscription *rabbitmq.Consumer
 	processor    *Processor
 	publisher    JobPublisher
+	locker       ProcessingLocker
 	queueName    string
 	log          zerolog.Logger
 	maxRetries   int
 	retryDelay   time.Duration
+	lockTTL      time.Duration
 }
 
 func NewConsumer(
 	subscription *rabbitmq.Consumer,
 	processor *Processor,
 	publisher JobPublisher,
+	locker ProcessingLocker,
 	queueName string,
 	maxRetries int,
 	retryDelay time.Duration,
+	lockTTL time.Duration,
 	log zerolog.Logger,
 ) *Consumer {
 	return &Consumer{
 		subscription: subscription,
 		processor:    processor,
 		publisher:    publisher,
+		locker:       locker,
 		queueName:    queueName,
 		maxRetries:   maxRetries,
 		retryDelay:   retryDelay,
+		lockTTL:      lockTTL,
 		log:          log,
 	}
 }
@@ -73,6 +79,30 @@ func (c *Consumer) handleDelivery(ctx context.Context, delivery amqp.Delivery) e
 		Str("transfer_id", job.TransferID).
 		Int("attempt", job.Attempt).
 		Msg("processing transfer job")
+
+	lock, acquired, err := c.acquireProcessingLock(ctx, job.TransferID)
+	if err != nil {
+		return err
+	}
+
+	if !acquired {
+		c.log.Warn().
+			Str("transfer_id", job.TransferID).
+			Int("attempt", job.Attempt).
+			Msg("transfer processing already in progress, requeueing job")
+		return delivery.Nack(false, true)
+	}
+
+	if lock != nil {
+		defer func() {
+			if releaseErr := lock.Release(ctx); releaseErr != nil {
+				c.log.Error().
+					Err(releaseErr).
+					Str("transfer_id", job.TransferID).
+					Msg("release transfer processing lock")
+			}
+		}()
+	}
 
 	transfer, err := c.processor.ProcessTransfer(ctx, job.TransferID)
 	if err == nil {
@@ -110,6 +140,19 @@ func (c *Consumer) handleDelivery(ctx context.Context, delivery amqp.Delivery) e
 			Msg("transfer job failed permanently")
 		return delivery.Ack(false)
 	}
+}
+
+func (c *Consumer) acquireProcessingLock(ctx context.Context, transferID string) (ProcessingLock, bool, error) {
+	if c.locker == nil {
+		return nil, true, nil
+	}
+
+	lock, acquired, err := c.locker.Acquire(ctx, transferID, c.lockTTL)
+	if err != nil {
+		return nil, false, fmt.Errorf("acquire transfer processing lock: %w", err)
+	}
+
+	return lock, acquired, nil
 }
 
 func (c *Consumer) retryJob(ctx context.Context, delivery amqp.Delivery, job TransferJob, err error) error {

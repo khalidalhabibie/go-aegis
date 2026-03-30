@@ -44,8 +44,13 @@ Aegis is a production-style Go backend scaffold for orchestrating EVM-compatible
 │   │       ├── consumer.go
 │   │       ├── errors.go
 │   │       ├── job.go
+│   │       ├── lock.go
 │   │       ├── model.go
 │   │       ├── mocks.go
+│   │       ├── outbox.go
+│   │       ├── outbox_dispatcher.go
+│   │       ├── outbox_dispatcher_test.go
+│   │       ├── outbox_repository.go
 │   │       ├── processor.go
 │   │       ├── processor_test.go
 │   │       ├── postgres_repository.go
@@ -102,7 +107,9 @@ Aegis is a production-style Go backend scaffold for orchestrating EVM-compatible
 │   ├── 000005_webhook_delivery_extensions.down.sql
 │   ├── 000005_webhook_delivery_extensions.up.sql
 │   ├── 000006_reconciliation_results.down.sql
-│   └── 000006_reconciliation_results.up.sql
+│   ├── 000006_reconciliation_results.up.sql
+│   ├── 000007_transfer_outbox.down.sql
+│   └── 000007_transfer_outbox.up.sql
 ├── .dockerignore
 ├── .env.example
 ├── Dockerfile
@@ -139,6 +146,7 @@ Aegis is a production-style Go backend scaffold for orchestrating EVM-compatible
    psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000004_wallets.up.sql
    psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000005_webhook_delivery_extensions.up.sql
    psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000006_reconciliation_results.up.sql
+   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000007_transfer_outbox.up.sql
    ```
 
 4. Install Go dependencies and run the API.
@@ -176,7 +184,8 @@ The API container listens on port `8080`. RabbitMQ management is exposed on `htt
 - Postgres, Redis, RabbitMQ, and EVM bootstrap layers
 - Health endpoint covering core dependencies
 - Transfer request create/get/list API with PostgreSQL persistence and idempotency
-- RabbitMQ-backed async transfer job publishing and worker consumption
+- Transactional transfer outbox so create requests do not depend on immediate RabbitMQ publish success
+- RabbitMQ-backed async transfer job dispatch and worker consumption
 - Resumable status machine: `CREATED -> VALIDATED -> QUEUED -> SIGNING -> SUBMITTED -> PENDING_ON_CHAIN`
 - Transfer status history table with initial `CREATED` transition writes and every later transition recorded
 - Wallet registry API with duplicate active-wallet protection on the same chain/address
@@ -234,7 +243,18 @@ Sample response:
 ```
 
 `POST /api/v1/transfers` returns `201 Created` for a new transfer and `200 OK` when the `idempotency_key` already exists.
-The worker asynchronously advances the transfer through validation, queueing, signing, submission, and `PENDING_ON_CHAIN`.
+The API writes the transfer row and a pending transfer outbox event in one Postgres transaction. A worker-side outbox dispatcher publishes that event to RabbitMQ and retries later if RabbitMQ is unavailable, so the create request remains durable even when the broker is temporarily down.
+The transfer worker asynchronously advances the transfer through validation, queueing, signing, submission, and `PENDING_ON_CHAIN`.
+
+## Transfer Dispatch Architecture
+
+Transfer creation uses a transactional outbox:
+
+1. `POST /api/v1/transfers` inserts the transfer request, writes the initial `CREATED` status history row, and inserts a `transfer_outbox` event in the same database transaction.
+2. The outbox dispatcher polls pending outbox rows and publishes transfer jobs to RabbitMQ.
+3. Outbox rows are marked `DISPATCHED` only after a successful publish.
+4. If publish fails, the row stays retryable and the dispatcher backs off before trying again.
+5. Duplicate outbox dispatch is tolerated. The transfer consumer uses a short-lived Redis lock per transfer to avoid concurrent duplicate processing.
 
 ### Get a transfer by ID
 

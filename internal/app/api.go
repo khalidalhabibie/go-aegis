@@ -52,8 +52,7 @@ func RunAPI(ctx context.Context) error {
 	)
 
 	transferRepository := transfers.NewPostgresRepository(container.Postgres)
-	transferPublisher := transfers.NewRabbitMQJobPublisher(container.RabbitMQ, cfg.RabbitMQ, container.Logger)
-	transferService := transfers.NewService(transferRepository, transferPublisher, container.Logger)
+	transferService := transfers.NewService(transferRepository, container.Logger)
 	walletRepository := wallets.NewPostgresRepository(container.Postgres)
 	walletService := wallets.NewService(walletRepository, container.Logger)
 	reconciliationRepository := reconciliation.NewPostgresRepository(container.Postgres)

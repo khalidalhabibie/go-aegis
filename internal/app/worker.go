@@ -40,19 +40,31 @@ func RunWorker(ctx context.Context) error {
 
 	transferRepository := transfers.NewPostgresRepository(container.Postgres)
 	transferPublisher := transfers.NewRabbitMQJobPublisher(container.RabbitMQ, cfg.RabbitMQ, container.Logger)
+	transferLocker := transfers.NewRedisProcessingLocker(container.Redis, "")
 	transferProcessor := transfers.NewProcessor(
 		transferRepository,
 		transfers.NewMockSigner(container.Logger),
 		transfers.NewMockBroadcaster(container.Logger),
 		container.Logger,
 	)
+	outboxDispatcher := transfers.NewOutboxDispatcher(
+		transferRepository,
+		transferPublisher,
+		cfg.Worker.TransferOutboxBatchSize,
+		cfg.Worker.TransferOutboxPollInterval,
+		cfg.Worker.TransferOutboxRetryDelay,
+		cfg.Worker.TransferOutboxProcessingAfter,
+		container.Logger,
+	)
 	transferConsumer := transfers.NewConsumer(
 		subscription,
 		transferProcessor,
 		transferPublisher,
+		transferLocker,
 		cfg.RabbitMQ.TransferQueue,
 		cfg.Worker.TransferMaxRetries,
 		cfg.Worker.TransferRetryDelay,
+		cfg.Worker.TransferProcessLockTTL,
 		container.Logger,
 	)
 	webhookRepository := webhooks.NewPostgresRepository(container.Postgres)
@@ -74,6 +86,14 @@ func RunWorker(ctx context.Context) error {
 		Msg("worker ready")
 
 	group, groupCtx := errgroup.WithContext(ctx)
+
+	group.Go(func() error {
+		if err := outboxDispatcher.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("run transfer outbox dispatcher: %w", err)
+		}
+
+		return nil
+	})
 
 	group.Go(func() error {
 		if err := transferConsumer.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) {
