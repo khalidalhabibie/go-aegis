@@ -142,3 +142,15 @@ func (s *stubRepository) TransitionStatus(ctx context.Context, params Transition
 
 	return s.transitionFn(ctx, params)
 }
+
+func (s *stubRepository) GetLatestAttempt(context.Context, string) (TransactionAttempt, error) {
+	return TransactionAttempt{}, ErrTransactionAttemptNotFound
+}
+
+func (s *stubRepository) CreateAttempt(context.Context, CreateAttemptParams) (TransactionAttempt, error) {
+	return TransactionAttempt{}, nil
+}
+
+func (s *stubRepository) UpdateAttempt(context.Context, UpdateAttemptParams) (TransactionAttempt, error) {
+	return TransactionAttempt{}, nil
+}

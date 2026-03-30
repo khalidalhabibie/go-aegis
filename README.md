@@ -47,6 +47,7 @@ Aegis is a production-style Go backend scaffold for orchestrating EVM-compatible
 │   │       ├── lock.go
 │   │       ├── model.go
 │   │       ├── mocks.go
+│   │       ├── attempt.go
 │   │       ├── outbox.go
 │   │       ├── outbox_dispatcher.go
 │   │       ├── outbox_dispatcher_test.go
@@ -109,7 +110,9 @@ Aegis is a production-style Go backend scaffold for orchestrating EVM-compatible
 │   ├── 000006_reconciliation_results.down.sql
 │   ├── 000006_reconciliation_results.up.sql
 │   ├── 000007_transfer_outbox.down.sql
-│   └── 000007_transfer_outbox.up.sql
+│   ├── 000007_transfer_outbox.up.sql
+│   ├── 000008_transaction_attempt_recovery.down.sql
+│   └── 000008_transaction_attempt_recovery.up.sql
 ├── .dockerignore
 ├── .env.example
 ├── Dockerfile
@@ -147,6 +150,7 @@ Aegis is a production-style Go backend scaffold for orchestrating EVM-compatible
    psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000005_webhook_delivery_extensions.up.sql
    psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000006_reconciliation_results.up.sql
    psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000007_transfer_outbox.up.sql
+   psql "postgres://aegis:aegis@127.0.0.1:5432/aegis?sslmode=disable" -f migrations/000008_transaction_attempt_recovery.up.sql
    ```
 
 4. Install Go dependencies and run the API.
@@ -175,6 +179,27 @@ docker compose up --build
 
 The API container listens on port `8080`. RabbitMQ management is exposed on `http://127.0.0.1:15672`.
 
+## Git Ignore
+
+The repository root includes a `.gitignore` for:
+
+- Go build outputs and caches
+- local `.env` files
+- editor and OS noise
+- Foundry build artifacts and installed libraries under `contracts/`
+
+## CI/CD
+
+GitHub Actions workflows are included under `.github/workflows`:
+
+- `ci.yml`: runs Go formatting checks, Go tests, binary builds, Docker image build validation, and Foundry format/test/build checks
+- `cd.yml`: builds and pushes the production image to `ghcr.io/<owner>/<repo>` on version tags like `v1.0.0` or manual dispatch
+
+Notes:
+
+- The CI workflow installs Foundry dependencies during the run, so contract CI does not depend on committed `contracts/lib` artifacts.
+- The published runtime image contains both `aegis-api` and `aegis-worker`, so the deploy platform can run the same image with different commands for API and worker processes.
+
 ## Current Capabilities
 
 - API and worker processes with separate entrypoints
@@ -186,6 +211,7 @@ The API container listens on port `8080`. RabbitMQ management is exposed on `htt
 - Transfer request create/get/list API with PostgreSQL persistence and idempotency
 - Transactional transfer outbox so create requests do not depend on immediate RabbitMQ publish success
 - RabbitMQ-backed async transfer job dispatch and worker consumption
+- Durable transaction attempts so signed payloads and `tx_hash` survive worker crashes during submission
 - Resumable status machine: `CREATED -> VALIDATED -> QUEUED -> SIGNING -> SUBMITTED -> PENDING_ON_CHAIN`
 - Transfer status history table with initial `CREATED` transition writes and every later transition recorded
 - Wallet registry API with duplicate active-wallet protection on the same chain/address
@@ -255,6 +281,16 @@ Transfer creation uses a transactional outbox:
 3. Outbox rows are marked `DISPATCHED` only after a successful publish.
 4. If publish fails, the row stays retryable and the dispatcher backs off before trying again.
 5. Duplicate outbox dispatch is tolerated. The transfer consumer uses a short-lived Redis lock per transfer to avoid concurrent duplicate processing.
+
+## Durable Submission Recovery
+
+Transfer submission uses `transaction_attempts` as durable recovery state:
+
+1. When a transfer reaches `SIGNING`, the worker signs it and persists the signed payload, nonce, and deterministic `tx_hash` as a `SIGNED` transaction attempt before broadcast.
+2. The worker moves that attempt to `BROADCASTING` and sends the exact persisted payload to the blockchain adapter.
+3. After broadcast succeeds, the attempt is marked `BROADCASTED`, then the transfer is advanced to `SUBMITTED` and later `PENDING_ON_CHAIN`.
+4. If the worker crashes after broadcast, retries inspect the latest persisted attempt instead of signing a brand-new transaction.
+5. A `BROADCASTING` attempt is safe to rebroadcast because it reuses the same signed payload and `tx_hash`, which avoids accidental double-send semantics.
 
 ### Get a transfer by ID
 

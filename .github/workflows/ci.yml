@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go Test And Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify Go formatting
+        run: test -z "$(gofmt -l .)"
+
+      - name: Run Go tests
+        run: go test ./...
+
+      - name: Build binaries
+        run: go build ./cmd/api ./cmd/worker
+
+      - name: Build container image
+        run: docker build -t aegis:ci .
+
+  contracts:
+    name: Foundry Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Install contract dependencies
+        run: |
+          forge install OpenZeppelin/openzeppelin-contracts --no-commit
+          forge install foundry-rs/forge-std --no-commit
+
+      - name: Check formatting
+        run: forge fmt --check
+
+      - name: Run contract tests
+        run: forge test -vvv
+
+      - name: Build contracts
+        run: forge build
+

@@ -7,6 +7,7 @@ import (
 
 var ErrInvalidTransferState = errors.New("invalid transfer state")
 var ErrTransient = errors.New("transient error")
+var ErrTransactionAttemptNotFound = errors.New("transaction attempt not found")
 
 type InvalidStateError struct {
 	TransferID string
