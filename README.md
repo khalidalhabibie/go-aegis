@@ -95,6 +95,7 @@ Aegis is a production-style Go backend scaffold for orchestrating EVM-compatible
 │           │   ├── transfers_dto.go
 │           │   ├── wallets.go
 │           │   └── wallets_dto.go
+│           ├── internal_auth.go
 │           └── server.go
 ├── migrations
 │   ├── 000001_init.down.sql
@@ -206,6 +207,14 @@ Notes:
 - The CI workflow installs Foundry dependencies during the run, so contract CI does not depend on committed `contracts/lib` artifacts.
 - The published runtime image contains both `aegis-api` and `aegis-worker`, so the deploy platform can run the same image with different commands for API and worker processes.
 
+## Security Defaults
+
+- Operational routes are protected by a static internal API key header
+- Callback URLs reject localhost and private-network targets by default
+- Optional callback host allowlisting is supported
+- Outbound webhooks can be signed with HMAC SHA-256 using timestamped headers
+- Persisted webhook response bodies are truncated and sanitized before storage
+
 ## Current Capabilities
 
 - API and worker processes with separate entrypoints
@@ -228,6 +237,8 @@ Notes:
 - Manual reconciliation job plus mismatch query API backed by persisted reconciliation results
 - Mock signer and mock blockchain broadcaster placeholders for future replacement
 - Initial schema for transfer requests, transaction attempts, and webhook deliveries
+- Internal auth middleware for wallet and reconciliation operations
+- Safer callback URL validation and signed outbound webhooks
 
 ## Transfer API
 
@@ -281,6 +292,14 @@ Sample response:
 The API writes the transfer row and a pending transfer outbox event in one Postgres transaction. A worker-side outbox dispatcher publishes that event to RabbitMQ and retries later if RabbitMQ is unavailable, so the create request remains durable even when the broker is temporarily down.
 The transfer worker asynchronously advances the transfer through validation, queueing, signing, submission, and `PENDING_ON_CHAIN`.
 
+Callback URL security policy:
+
+- Only `http` and `https` are allowed
+- userinfo such as `https://user:pass@...` is rejected
+- localhost, loopback, link-local, multicast, and private IP destinations are rejected by default
+- set `CALLBACK_URL_ALLOW_PRIVATE_TARGETS=true` only for trusted internal environments
+- set `CALLBACK_URL_ALLOWED_HOSTS` to a comma-separated allowlist for stricter outbound control
+
 ## Transfer Dispatch Architecture
 
 Transfer creation uses a transactional outbox:
@@ -321,8 +340,32 @@ curl --request GET \
 
 ```bash
 curl --request POST \
-  --url http://127.0.0.1:8080/api/v1/jobs/reconcile
+  --url http://127.0.0.1:8080/api/v1/jobs/reconcile \
+  --header 'X-Aegis-Internal-Key: change-me'
 ```
+
+Wallet registry and reconciliation endpoints require the configured internal auth header. If `INTERNAL_AUTH_API_KEY` is empty, those routes stay unavailable rather than open.
+
+## Webhook Verification
+
+When `WEBHOOK_SIGNING_SECRET` is configured, outbound webhooks include:
+
+- `X-Aegis-Timestamp`
+- `X-Aegis-Signature`
+
+The signature format is `v1=<hex hmac sha256>` over:
+
+```text
+<timestamp>.<raw request body>
+```
+
+Receivers should:
+
+1. recompute the HMAC with the shared secret
+2. compare signatures in constant time
+3. reject stale timestamps outside their accepted replay window
+
+Webhook response persistence is intentionally capped by `WEBHOOK_RESPONSE_BODY_MAX_BYTES` so Aegis does not store large or overly sensitive upstream response bodies by default.
 
 ### List latest mismatches
 

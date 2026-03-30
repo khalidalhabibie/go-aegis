@@ -29,7 +29,7 @@ func TestCreateTransferNormalizesInput(t *testing.T) {
 		},
 	}
 
-	service := NewService(repo, zerolog.Nop())
+	service := NewService(repo, CallbackURLPolicy{}, zerolog.Nop())
 
 	transfer, created, err := service.CreateTransfer(context.Background(), CreateInput{
 		IdempotencyKey:     " idem-1 ",
@@ -55,7 +55,7 @@ func TestCreateTransferNormalizesInput(t *testing.T) {
 }
 
 func TestCreateTransferRejectsInvalidAmount(t *testing.T) {
-	service := NewService(&stubRepository{}, zerolog.Nop())
+	service := NewService(&stubRepository{}, CallbackURLPolicy{}, zerolog.Nop())
 
 	_, _, err := service.CreateTransfer(context.Background(), CreateInput{
 		IdempotencyKey:     "idem-1",
@@ -89,7 +89,7 @@ func TestListTransfersNormalizesPagination(t *testing.T) {
 		},
 	}
 
-	service := NewService(repo, zerolog.Nop())
+	service := NewService(repo, CallbackURLPolicy{}, zerolog.Nop())
 
 	result, err := service.ListTransfers(context.Background(), ListInput{
 		Limit:  150,

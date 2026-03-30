@@ -10,15 +10,17 @@ import (
 )
 
 type Config struct {
-	App        AppConfig
-	Log        LogConfig
-	HTTP       HTTPConfig
-	Worker     WorkerConfig
-	Webhook    WebhookConfig
-	Database   DatabaseConfig
-	Redis      RedisConfig
-	RabbitMQ   RabbitMQConfig
-	Blockchain BlockchainConfig
+	App          AppConfig
+	Log          LogConfig
+	HTTP         HTTPConfig
+	InternalAuth InternalAuthConfig
+	CallbackURL  CallbackURLConfig
+	Worker       WorkerConfig
+	Webhook      WebhookConfig
+	Database     DatabaseConfig
+	Redis        RedisConfig
+	RabbitMQ     RabbitMQConfig
+	Blockchain   BlockchainConfig
 }
 
 type AppConfig struct {
@@ -46,6 +48,16 @@ func (c HTTPConfig) Address() string {
 	return net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 }
 
+type InternalAuthConfig struct {
+	HeaderName string `env:"INTERNAL_AUTH_HEADER" envDefault:"X-Aegis-Internal-Key"`
+	APIKey     string `env:"INTERNAL_AUTH_API_KEY"`
+}
+
+type CallbackURLConfig struct {
+	AllowedHosts        []string `env:"CALLBACK_URL_ALLOWED_HOSTS" envSeparator:","`
+	AllowPrivateTargets bool     `env:"CALLBACK_URL_ALLOW_PRIVATE_TARGETS" envDefault:"false"`
+}
+
 type WorkerConfig struct {
 	ConsumerTag                   string        `env:"WORKER_CONSUMER_TAG" envDefault:"aegis-worker"`
 	TransferMaxRetries            int           `env:"WORKER_TRANSFER_MAX_RETRIES" envDefault:"3"`
@@ -59,11 +71,13 @@ type WorkerConfig struct {
 }
 
 type WebhookConfig struct {
-	Timeout        time.Duration `env:"WEBHOOK_TIMEOUT" envDefault:"10s"`
-	MaxAttempts    int           `env:"WEBHOOK_MAX_ATTEMPTS" envDefault:"5"`
-	InitialBackoff time.Duration `env:"WEBHOOK_INITIAL_BACKOFF" envDefault:"2s"`
-	BatchSize      int           `env:"WEBHOOK_BATCH_SIZE" envDefault:"25"`
-	LeaseDuration  time.Duration `env:"WEBHOOK_LEASE_DURATION" envDefault:"30s"`
+	Timeout              time.Duration `env:"WEBHOOK_TIMEOUT" envDefault:"10s"`
+	MaxAttempts          int           `env:"WEBHOOK_MAX_ATTEMPTS" envDefault:"5"`
+	InitialBackoff       time.Duration `env:"WEBHOOK_INITIAL_BACKOFF" envDefault:"2s"`
+	BatchSize            int           `env:"WEBHOOK_BATCH_SIZE" envDefault:"25"`
+	LeaseDuration        time.Duration `env:"WEBHOOK_LEASE_DURATION" envDefault:"30s"`
+	SigningSecret        string        `env:"WEBHOOK_SIGNING_SECRET"`
+	ResponseBodyMaxBytes int           `env:"WEBHOOK_RESPONSE_BODY_MAX_BYTES" envDefault:"512"`
 }
 
 type DatabaseConfig struct {

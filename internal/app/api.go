@@ -52,7 +52,10 @@ func RunAPI(ctx context.Context) error {
 	)
 
 	transferRepository := transfers.NewPostgresRepository(container.Postgres)
-	transferService := transfers.NewService(transferRepository, container.Logger)
+	transferService := transfers.NewService(transferRepository, transfers.CallbackURLPolicy{
+		AllowedHosts:        cfg.CallbackURL.AllowedHosts,
+		AllowPrivateTargets: cfg.CallbackURL.AllowPrivateTargets,
+	}, container.Logger)
 	walletRepository := wallets.NewPostgresRepository(container.Postgres)
 	walletService := wallets.NewService(walletRepository, container.Logger)
 	reconciliationRepository := reconciliation.NewPostgresRepository(container.Postgres)
@@ -64,6 +67,7 @@ func RunAPI(ctx context.Context) error {
 
 	server := httptransport.NewServer(
 		cfg.HTTP,
+		cfg.InternalAuth,
 		cfg.App.Env,
 		container.Logger,
 		handlers.NewHealthHandler(healthService),
