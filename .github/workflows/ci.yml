@@ -53,8 +53,8 @@ jobs:
 
       - name: Install contract dependencies
         run: |
-          forge install OpenZeppelin/openzeppelin-contracts --no-commit
-          forge install foundry-rs/forge-std --no-commit
+          forge install OpenZeppelin/openzeppelin-contracts
+          forge install foundry-rs/forge-std
 
       - name: Check formatting
         run: forge fmt --check
@@ -64,4 +64,3 @@ jobs:
 
       - name: Build contracts
         run: forge build
-
