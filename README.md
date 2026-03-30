@@ -318,10 +318,14 @@ go test ./internal/modules/webhooks
 go test ./internal/transport/http
 ```
 
-## Known Limitations / Next Steps
+## Known Limitations
 
-- The blockchain signer and broadcaster are mocks today. Replacing them with real EVM signing and submission is the largest remaining gap.
-- Reconciliation still uses a placeholder checker and is only exposed through an internal manual route.
-- There is no built-in SQL migration runner.
-- SSRF controls are application-layer and should be backed by egress restrictions.
-- Worker supervision restarts subsystems indefinitely; production deployments should add alerting and health signals for persistent restart loops.
+- Webhook lease handling is improved: stale workers can no longer overwrite a newer delivery state after losing their lease. Delivery is still at-least-once, not exactly-once. If a receiver processes the request but the worker crashes, times out, or loses the lease before persisting `DELIVERED`, the same webhook can be retried later. Production receivers still need idempotent handling keyed by `X-Aegis-Delivery-ID`.
+
+- Durable transaction attempt ownership is improved: attempt status writes are now compare-and-set, so stale workers cannot silently regress a newer `transaction_attempts` row. The overall transfer worker still relies on a short Redis lock without lease renewal. If a worker stalls past the lock TTL or crashes after submitting a transaction but before persisting the next state, another worker can resume and rebroadcast the same signed transaction. That is safer than signing a new transaction, but it is still an at-least-once submission model and should not be treated as strict single-owner execution.
+
+- Callback hardening is improved: Aegis validates callback URLs on create, re-validates DNS results before dispatch, and re-validates redirect targets. This is still application-layer SSRF mitigation, not a full network boundary. Validation and actual TCP connect are separate steps, so DNS rebinding and other time-of-check/time-of-use issues are not fully eliminated without tighter egress controls or a custom transport that pins validated IPs.
+
+- Worker supervision is improved: transfer outbox dispatch, transfer consumption, and webhook delivery fail independently and restart with backoff. The tradeoff is degraded-but-still-running behavior. A broken subsystem can loop in restart while the process stays alive, so orchestration will not necessarily see a hard failure unless additional health signals, metrics, or alerts are added.
+
+- The blockchain submission path is still not production-ready because the default signer and broadcaster are mocks in `internal/modules/transfers/mocks.go`. Reconciliation also still uses the placeholder receipt checker in `internal/modules/reconciliation/checker.go`, so on-chain state observation is not yet authoritative.
