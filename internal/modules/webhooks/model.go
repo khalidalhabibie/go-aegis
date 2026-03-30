@@ -7,6 +7,7 @@ import (
 
 const DeliveryStatusPending = "PENDING"
 const DeliveryStatusRetrying = "RETRYING"
+const DeliveryStatusInProgress = "IN_PROGRESS"
 const DeliveryStatusDelivered = "DELIVERED"
 const DeliveryStatusFailed = "FAILED"
 
@@ -25,6 +26,7 @@ type Delivery struct {
 	ResponseBody            string          `json:"response_body"`
 	LastError               string          `json:"last_error"`
 	NextAttemptAt           *time.Time      `json:"next_attempt_at"`
+	LeaseExpiresAt          *time.Time      `json:"lease_expires_at"`
 	DeliveredAt             *time.Time      `json:"delivered_at"`
 	CreatedAt               time.Time       `json:"created_at"`
 	UpdatedAt               time.Time       `json:"updated_at"`

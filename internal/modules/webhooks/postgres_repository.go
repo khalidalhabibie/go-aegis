@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"aegis/internal/modules/transfers"
 
@@ -25,6 +26,7 @@ const deliverySelectColumns = `
 	response_body,
 	COALESCE(last_error, ''),
 	next_attempt_at,
+	lease_expires_at,
 	delivered_at,
 	created_at,
 	updated_at
@@ -94,20 +96,48 @@ func (r *PostgresRepository) ScheduleTransferStatusDeliveries(ctx context.Contex
 	return commandTag.RowsAffected(), nil
 }
 
-func (r *PostgresRepository) ListDueDeliveries(ctx context.Context, limit int) ([]Delivery, error) {
+func (r *PostgresRepository) ClaimDueDeliveries(ctx context.Context, limit int, leaseDuration time.Duration) ([]Delivery, error) {
+	if limit <= 0 {
+		limit = 25
+	}
+
+	if leaseDuration <= 0 {
+		leaseDuration = 30 * time.Second
+	}
+
 	rows, err := r.pool.Query(
 		ctx,
-		`SELECT `+deliverySelectColumns+`
-		FROM webhook_deliveries
-		WHERE delivery_status IN ('PENDING', 'RETRYING')
-			AND next_attempt_at IS NOT NULL
-			AND next_attempt_at <= NOW()
-		ORDER BY next_attempt_at ASC, created_at ASC
-		LIMIT $1`,
+		`WITH candidates AS (
+			SELECT id
+			FROM webhook_deliveries
+			WHERE (
+				delivery_status IN ($1, $2)
+				AND next_attempt_at IS NOT NULL
+				AND next_attempt_at <= NOW()
+			) OR (
+				delivery_status = $3
+				AND lease_expires_at IS NOT NULL
+				AND lease_expires_at <= NOW()
+			)
+			ORDER BY next_attempt_at ASC NULLS FIRST, created_at ASC
+			LIMIT $4
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE webhook_deliveries AS deliveries
+		SET delivery_status = $3,
+			lease_expires_at = NOW() + $5::interval,
+			updated_at = NOW()
+		FROM candidates
+		WHERE deliveries.id = candidates.id
+		RETURNING `+deliverySelectColumns,
+		DeliveryStatusPending,
+		DeliveryStatusRetrying,
+		DeliveryStatusInProgress,
 		limit,
+		formatPostgresInterval(leaseDuration),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("list due webhook deliveries: %w", err)
+		return nil, fmt.Errorf("claim due webhook deliveries: %w", err)
 	}
 	defer rows.Close()
 
@@ -115,14 +145,14 @@ func (r *PostgresRepository) ListDueDeliveries(ctx context.Context, limit int) (
 	for rows.Next() {
 		delivery, err := scanDelivery(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan webhook delivery: %w", err)
+			return nil, fmt.Errorf("scan claimed webhook delivery: %w", err)
 		}
 
 		deliveries = append(deliveries, delivery)
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate webhook deliveries: %w", err)
+		return nil, fmt.Errorf("iterate claimed webhook deliveries: %w", err)
 	}
 
 	return deliveries, nil
@@ -138,6 +168,7 @@ func (r *PostgresRepository) MarkDelivered(ctx context.Context, params MarkDeliv
 			response_body = $4,
 			last_error = '',
 			next_attempt_at = NULL,
+			lease_expires_at = NULL,
 			delivered_at = NOW(),
 			updated_at = NOW()
 		WHERE id = $1`,
@@ -162,6 +193,7 @@ func (r *PostgresRepository) MarkRetry(ctx context.Context, params MarkRetryPara
 			response_body = $4,
 			last_error = $5,
 			next_attempt_at = $6,
+			lease_expires_at = NULL,
 			delivered_at = NULL,
 			updated_at = NOW()
 		WHERE id = $1`,
@@ -188,6 +220,7 @@ func (r *PostgresRepository) MarkFailed(ctx context.Context, params MarkFailedPa
 			response_body = $4,
 			last_error = $5,
 			next_attempt_at = NULL,
+			lease_expires_at = NULL,
 			delivered_at = NULL,
 			updated_at = NOW()
 		WHERE id = $1`,
@@ -226,6 +259,7 @@ func scanDelivery(scanner deliveryScanner) (Delivery, error) {
 		&delivery.ResponseBody,
 		&delivery.LastError,
 		&delivery.NextAttemptAt,
+		&delivery.LeaseExpiresAt,
 		&delivery.DeliveredAt,
 		&delivery.CreatedAt,
 		&delivery.UpdatedAt,
@@ -240,4 +274,8 @@ func scanDelivery(scanner deliveryScanner) (Delivery, error) {
 	}
 
 	return delivery, nil
+}
+
+func formatPostgresInterval(duration time.Duration) string {
+	return fmt.Sprintf("%.6f seconds", duration.Seconds())
 }

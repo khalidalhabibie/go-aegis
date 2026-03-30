@@ -16,9 +16,10 @@ type Service struct {
 	maxAttempts    int
 	initialBackoff time.Duration
 	batchSize      int
+	leaseDuration  time.Duration
 }
 
-func NewService(repository Repository, dispatcher Dispatcher, maxAttempts int, initialBackoff time.Duration, batchSize int, log zerolog.Logger) *Service {
+func NewService(repository Repository, dispatcher Dispatcher, maxAttempts int, initialBackoff time.Duration, batchSize int, leaseDuration time.Duration, log zerolog.Logger) *Service {
 	if maxAttempts <= 0 {
 		maxAttempts = 5
 	}
@@ -31,6 +32,10 @@ func NewService(repository Repository, dispatcher Dispatcher, maxAttempts int, i
 		batchSize = 25
 	}
 
+	if leaseDuration <= 0 {
+		leaseDuration = 30 * time.Second
+	}
+
 	return &Service{
 		repository:     repository,
 		dispatcher:     dispatcher,
@@ -38,6 +43,7 @@ func NewService(repository Repository, dispatcher Dispatcher, maxAttempts int, i
 		maxAttempts:    maxAttempts,
 		initialBackoff: initialBackoff,
 		batchSize:      batchSize,
+		leaseDuration:  leaseDuration,
 	}
 }
 
@@ -51,9 +57,16 @@ func (s *Service) RunCycle(ctx context.Context) error {
 		s.log.Info().Int64("scheduled", scheduled).Msg("scheduled webhook deliveries")
 	}
 
-	deliveries, err := s.repository.ListDueDeliveries(ctx, s.batchSize)
+	deliveries, err := s.repository.ClaimDueDeliveries(ctx, s.batchSize, s.leaseDuration)
 	if err != nil {
 		return err
+	}
+
+	if len(deliveries) > 0 {
+		s.log.Info().
+			Int("claimed", len(deliveries)).
+			Dur("lease_duration", s.leaseDuration).
+			Msg("claimed webhook deliveries")
 	}
 
 	for _, delivery := range deliveries {
