@@ -4,13 +4,20 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+	"time"
 
 	"aegis/internal/bootstrap"
 	"aegis/internal/config"
 	"aegis/internal/modules/transfers"
 	"aegis/internal/modules/webhooks"
 
-	"golang.org/x/sync/errgroup"
+	"github.com/rs/zerolog"
+)
+
+const (
+	initialSubsystemRestartBackoff = 2 * time.Second
+	maxSubsystemRestartBackoff     = 30 * time.Second
 )
 
 func RunWorker(ctx context.Context) error {
@@ -33,11 +40,6 @@ func RunWorker(ctx context.Context) error {
 		return err
 	}
 
-	subscription, err := container.RabbitMQ.Consume(cfg.RabbitMQ.TransferQueue, cfg.Worker.ConsumerTag)
-	if err != nil {
-		return fmt.Errorf("start transfer consumer: %w", err)
-	}
-
 	transferRepository := transfers.NewPostgresRepository(container.Postgres)
 	transferPublisher := transfers.NewRabbitMQJobPublisher(container.RabbitMQ, cfg.RabbitMQ, container.Logger)
 	transferLocker := transfers.NewRedisProcessingLocker(container.Redis, "")
@@ -56,17 +58,6 @@ func RunWorker(ctx context.Context) error {
 		cfg.Worker.TransferOutboxProcessingAfter,
 		container.Logger,
 	)
-	transferConsumer := transfers.NewConsumer(
-		subscription,
-		transferProcessor,
-		transferPublisher,
-		transferLocker,
-		cfg.RabbitMQ.TransferQueue,
-		cfg.Worker.TransferMaxRetries,
-		cfg.Worker.TransferRetryDelay,
-		cfg.Worker.TransferProcessLockTTL,
-		container.Logger,
-	)
 	webhookRepository := webhooks.NewPostgresRepository(container.Postgres)
 	webhookDispatcher := webhooks.NewHTTPDispatcher(cfg.Webhook.Timeout)
 	webhookService := webhooks.NewService(
@@ -78,7 +69,6 @@ func RunWorker(ctx context.Context) error {
 		cfg.Webhook.LeaseDuration,
 		container.Logger,
 	)
-	webhookWorker := webhooks.NewWorker(webhookService, cfg.Worker.WebhookPollInterval)
 
 	container.Logger.Info().
 		Str("queue", cfg.RabbitMQ.TransferQueue).
@@ -86,37 +76,112 @@ func RunWorker(ctx context.Context) error {
 		Str("consumer_tag", cfg.Worker.ConsumerTag).
 		Msg("worker ready")
 
-	group, groupCtx := errgroup.WithContext(ctx)
+	var waitGroup sync.WaitGroup
 
-	group.Go(func() error {
-		if err := outboxDispatcher.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) {
+	superviseWorkerSubsystem(ctx, &waitGroup, "transfer_outbox_dispatcher", container.Logger, func(runCtx context.Context) error {
+		if err := outboxDispatcher.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 			return fmt.Errorf("run transfer outbox dispatcher: %w", err)
 		}
 
 		return nil
 	})
 
-	group.Go(func() error {
-		if err := transferConsumer.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) {
+	superviseWorkerSubsystem(ctx, &waitGroup, "transfer_consumer", container.Logger, func(runCtx context.Context) error {
+		subscription, consumeErr := container.RabbitMQ.Consume(cfg.RabbitMQ.TransferQueue, cfg.Worker.ConsumerTag)
+		if consumeErr != nil {
+			return fmt.Errorf("start transfer consumer: %w", consumeErr)
+		}
+
+		transferConsumer := transfers.NewConsumer(
+			subscription,
+			transferProcessor,
+			transferPublisher,
+			transferLocker,
+			cfg.RabbitMQ.TransferQueue,
+			cfg.Worker.TransferMaxRetries,
+			cfg.Worker.TransferRetryDelay,
+			cfg.Worker.TransferProcessLockTTL,
+			container.Logger,
+		)
+
+		if err := transferConsumer.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 			return fmt.Errorf("run transfer consumer: %w", err)
 		}
 
 		return nil
 	})
 
-	group.Go(func() error {
-		if err := webhookWorker.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) {
+	superviseWorkerSubsystem(ctx, &waitGroup, "webhook_worker", container.Logger, func(runCtx context.Context) error {
+		webhookWorker := webhooks.NewWorker(webhookService, cfg.Worker.WebhookPollInterval)
+		if err := webhookWorker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 			return fmt.Errorf("run webhook worker: %w", err)
 		}
 
 		return nil
 	})
 
-	if err := group.Wait(); err != nil {
-		return err
-	}
-
+	<-ctx.Done()
 	container.Logger.Info().Dur("timeout", cfg.App.ShutdownTimeout).Msg("worker shutdown requested")
+	waitGroup.Wait()
 
 	return nil
+}
+
+func superviseWorkerSubsystem(
+	ctx context.Context,
+	waitGroup *sync.WaitGroup,
+	name string,
+	log zerolog.Logger,
+	run func(context.Context) error,
+) {
+	waitGroup.Add(1)
+
+	go func() {
+		defer waitGroup.Done()
+
+		backoff := initialSubsystemRestartBackoff
+
+		for {
+			if ctx.Err() != nil {
+				log.Info().Str("subsystem", name).Msg("worker subsystem stopped")
+				return
+			}
+
+			log.Info().Str("subsystem", name).Msg("worker subsystem started")
+
+			err := run(ctx)
+			switch {
+			case err == nil:
+				if ctx.Err() != nil {
+					log.Info().Str("subsystem", name).Msg("worker subsystem stopped")
+					return
+				}
+
+				log.Warn().Str("subsystem", name).Msg("worker subsystem exited unexpectedly; restarting")
+			case errors.Is(err, context.Canceled):
+				log.Info().Str("subsystem", name).Msg("worker subsystem stopped")
+				return
+			default:
+				log.Error().
+					Err(err).
+					Str("subsystem", name).
+					Dur("restart_backoff", backoff).
+					Msg("worker subsystem failed; restarting")
+			}
+
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				log.Info().Str("subsystem", name).Msg("worker subsystem stopped")
+				return
+			case <-timer.C:
+			}
+
+			backoff *= 2
+			if backoff > maxSubsystemRestartBackoff {
+				backoff = maxSubsystemRestartBackoff
+			}
+		}
+	}()
 }
