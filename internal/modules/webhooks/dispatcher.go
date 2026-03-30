@@ -17,6 +17,7 @@ type HTTPDispatcher struct {
 	client               *http.Client
 	signer               *Signer
 	responseBodyMaxBytes int
+	now                  func() time.Time
 }
 
 func NewHTTPDispatcher(timeout time.Duration, signer *Signer, responseBodyMaxBytes int) *HTTPDispatcher {
@@ -24,6 +25,7 @@ func NewHTTPDispatcher(timeout time.Duration, signer *Signer, responseBodyMaxByt
 		client:               &http.Client{Timeout: timeout},
 		signer:               signer,
 		responseBodyMaxBytes: responseBodyMaxBytes,
+		now:                  time.Now,
 	}
 }
 
@@ -39,7 +41,12 @@ func (d *HTTPDispatcher) Dispatch(ctx context.Context, delivery Delivery) (Dispa
 	request.Header.Set("X-Aegis-Delivery-ID", delivery.ID)
 
 	if d.signer != nil {
-		timestamp, signature := d.signer.Sign(delivery.PayloadJSON, time.Now())
+		now := time.Now
+		if d.now != nil {
+			now = d.now
+		}
+
+		timestamp, signature := d.signer.Sign(delivery.PayloadJSON, now())
 		request.Header.Set(TimestampHeaderName, timestamp)
 		request.Header.Set(SignatureHeaderName, signature)
 	}
