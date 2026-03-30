@@ -18,11 +18,19 @@ end
 return 0
 `)
 
+var refreshProcessingLockScript = goredis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("PEXPIRE", KEYS[1], ARGV[2])
+end
+return 0
+`)
+
 type ProcessingLocker interface {
 	Acquire(ctx context.Context, transferID string, ttl time.Duration) (ProcessingLock, bool, error)
 }
 
 type ProcessingLock interface {
+	Refresh(ctx context.Context, ttl time.Duration) error
 	Release(ctx context.Context) error
 }
 
@@ -83,6 +91,27 @@ func (l *redisProcessingLock) Release(ctx context.Context) error {
 
 	if _, err := releaseProcessingLockScript.Run(ctx, l.client, []string{l.key}, l.token).Result(); err != nil {
 		return fmt.Errorf("release redis processing lock: %w", err)
+	}
+
+	return nil
+}
+
+func (l *redisProcessingLock) Refresh(ctx context.Context, ttl time.Duration) error {
+	if l == nil || l.client == nil {
+		return nil
+	}
+
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+
+	result, err := refreshProcessingLockScript.Run(ctx, l.client, []string{l.key}, l.token, ttl.Milliseconds()).Int()
+	if err != nil {
+		return fmt.Errorf("refresh redis processing lock: %w", err)
+	}
+
+	if result == 0 {
+		return ErrProcessingLockLost
 	}
 
 	return nil

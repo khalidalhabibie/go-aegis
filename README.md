@@ -179,6 +179,8 @@ go run ./cmd/api
 go run ./cmd/worker
 ```
 
+When enabled, the worker health endpoint is exposed at `http://127.0.0.1:8081/healthz` by default.
+
 ### Run the full stack in containers
 
 ```bash
@@ -215,6 +217,8 @@ Important environment variables are defined in `.env.example`.
 - `WORKER_TRANSFER_OUTBOX_RETRY_DELAY`: base delay for outbox publish retry backoff.
 - `WORKER_TRANSFER_OUTBOX_PROCESSING_AFTER`: age after which a stuck outbox row can be reclaimed.
 - `WORKER_WEBHOOK_POLL_INTERVAL`: webhook worker polling interval.
+- `WORKER_HEALTH_HOST`: bind host for the worker health endpoint.
+- `WORKER_HEALTH_PORT`: bind port for the worker health endpoint. Set `0` or a negative value to disable it.
 
 ### Webhook delivery and signing
 
@@ -280,7 +284,8 @@ These routes require the internal auth header and API key:
 - The worker supervises the transfer outbox dispatcher, transfer consumer, and webhook worker independently.
 - A failure in one subsystem does not immediately stop the others.
 - Each subsystem restarts with exponential backoff.
-- This improves isolation, but production monitoring should alert on repeated restart loops because the process can remain alive while one subsystem is degraded.
+- The worker also exposes subsystem state, restart counts, and degraded status through its own `/healthz` endpoint when enabled.
+- If a subsystem exceeds the consecutive failure budget, the worker exits instead of staying alive indefinitely in a restart loop.
 
 ### Graceful shutdown
 
@@ -322,10 +327,10 @@ go test ./internal/transport/http
 
 - Webhook lease handling is improved: stale workers can no longer overwrite a newer delivery state after losing their lease. Delivery is still at-least-once, not exactly-once. If a receiver processes the request but the worker crashes, times out, or loses the lease before persisting `DELIVERED`, the same webhook can be retried later. Production receivers still need idempotent handling keyed by `X-Aegis-Delivery-ID`.
 
-- Durable transaction attempt ownership is improved: attempt status writes are now compare-and-set, so stale workers cannot silently regress a newer `transaction_attempts` row. The overall transfer worker still relies on a short Redis lock without lease renewal. If a worker stalls past the lock TTL or crashes after submitting a transaction but before persisting the next state, another worker can resume and rebroadcast the same signed transaction. That is safer than signing a new transaction, but it is still an at-least-once submission model and should not be treated as strict single-owner execution.
+- Durable transaction attempt ownership is improved: attempt status writes are compare-and-set and the transfer processing lock now renews while work is in flight, which narrows the stale-worker window substantially. It is still not a strict exactly-once ownership model. If a worker crashes after submitting a transaction but before persisting the next durable state, another worker can still resume and rebroadcast the same signed transaction. That is safer than signing a new transaction, but it remains an at-least-once submission model.
 
-- Callback hardening is improved: Aegis validates callback URLs on create, re-validates DNS results before dispatch, and re-validates redirect targets. This is still application-layer SSRF mitigation, not a full network boundary. Validation and actual TCP connect are separate steps, so DNS rebinding and other time-of-check/time-of-use issues are not fully eliminated without tighter egress controls or a custom transport that pins validated IPs.
+- Callback hardening is improved: Aegis validates callback URLs on create, re-validates DNS results before dispatch, re-validates redirect targets, and pins outbound webhook connects to resolved IPs that passed validation. This closes the most obvious hostname-to-private-IP bypasses, but it is still application-layer SSRF mitigation, not a complete network boundary. Production deployments should still rely on outbound egress controls in addition to application checks.
 
-- Worker supervision is improved: transfer outbox dispatch, transfer consumption, and webhook delivery fail independently and restart with backoff. The tradeoff is degraded-but-still-running behavior. A broken subsystem can loop in restart while the process stays alive, so orchestration will not necessarily see a hard failure unless additional health signals, metrics, or alerts are added.
+- Worker supervision is improved: transfer outbox dispatch, transfer consumption, and webhook delivery fail independently, restart with backoff, and the worker exits after a subsystem exceeds its consecutive failure budget. The worker now has a dedicated health endpoint with per-subsystem state, but it still does not emit structured metrics or integrate with a richer monitoring backend out of the box.
 
 - The blockchain submission path is still not production-ready because the default signer and broadcaster are mocks in `internal/modules/transfers/mocks.go`. Reconciliation also still uses the placeholder receipt checker in `internal/modules/reconciliation/checker.go`, so on-chain state observation is not yet authoritative.

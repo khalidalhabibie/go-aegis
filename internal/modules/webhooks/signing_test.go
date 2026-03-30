@@ -1,6 +1,7 @@
 package webhooks
 
 import (
+	"bufio"
 	"context"
 	"io"
 	"net"
@@ -128,6 +129,73 @@ func TestHTTPDispatcherRejectsRedirectToPrivateTarget(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "validate redirect target") {
 		t.Fatalf("expected redirect validation failure, got %v", err)
+	}
+}
+
+func TestHTTPDispatcherPinsDialToValidatedIP(t *testing.T) {
+	dispatcher := NewHTTPDispatcher(5*time.Second, nil, TargetPolicy{AllowPrivateTargets: true}, 64)
+	dispatcher.lookupIPAddrs = func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	}
+
+	dialedAddresses := make(chan string, 1)
+	requestHosts := make(chan string, 1)
+	dispatcher.dialContext = func(_ context.Context, _, address string) (net.Conn, error) {
+		clientConn, serverConn := net.Pipe()
+
+		go func() {
+			defer serverConn.Close()
+
+			reader := bufio.NewReader(serverConn)
+			request, err := http.ReadRequest(reader)
+			if err != nil {
+				return
+			}
+			requestHosts <- request.Host
+
+			response := &http.Response{
+				StatusCode: http.StatusOK,
+				ProtoMajor: 1,
+				ProtoMinor: 1,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader("ok")),
+			}
+			_ = response.Write(serverConn)
+		}()
+
+		dialedAddresses <- address
+		return clientConn, nil
+	}
+
+	result, err := dispatcher.Dispatch(context.Background(), Delivery{
+		ID:          "delivery-pinned",
+		TargetURL:   "http://hooks.example.com:8080/webhooks",
+		PayloadJSON: []byte(`{"ok":true}`),
+	})
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, result.StatusCode)
+	}
+
+	select {
+	case address := <-dialedAddresses:
+		if address != "127.0.0.1:8080" {
+			t.Fatalf("expected dial to validated IP, got %q", address)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected dial address to be recorded")
+	}
+
+	select {
+	case host := <-requestHosts:
+		if host != "hooks.example.com:8080" {
+			t.Fatalf("expected request host to preserve original hostname, got %q", host)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected request host to be recorded")
 	}
 }
 

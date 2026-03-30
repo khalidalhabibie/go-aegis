@@ -3,6 +3,7 @@ package webhooks
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +11,8 @@ import (
 	"net/url"
 	"time"
 )
+
+type dialContextFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
 type Dispatcher interface {
 	Dispatch(ctx context.Context, delivery Delivery) (DispatchResult, error)
@@ -21,6 +24,7 @@ type HTTPDispatcher struct {
 	targetPolicy         TargetPolicy
 	responseBodyMaxBytes int
 	lookupIPAddrs        lookupIPAddrsFunc
+	dialContext          dialContextFunc
 	now                  func() time.Time
 }
 
@@ -31,6 +35,7 @@ func NewHTTPDispatcher(timeout time.Duration, signer *Signer, targetPolicy Targe
 		targetPolicy:         targetPolicy,
 		responseBodyMaxBytes: responseBodyMaxBytes,
 		lookupIPAddrs:        net.DefaultResolver.LookupIPAddr,
+		dialContext:          (&net.Dialer{Timeout: timeout}).DialContext,
 		now:                  time.Now,
 	}
 }
@@ -62,6 +67,7 @@ func (d *HTTPDispatcher) Dispatch(ctx context.Context, delivery Delivery) (Dispa
 	}
 
 	client := *d.client
+	client.Transport = d.transport()
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 10 {
 			return fmt.Errorf("stop after %d redirects", len(via))
@@ -98,4 +104,57 @@ func (d *HTTPDispatcher) Dispatch(ctx context.Context, delivery Delivery) (Dispa
 
 func (d *HTTPDispatcher) validateTarget(ctx context.Context, targetURL *url.URL) error {
 	return validateDispatchTarget(ctx, targetURL, d.targetPolicy, d.lookupIPAddrs)
+}
+
+func (d *HTTPDispatcher) transport() http.RoundTripper {
+	if d.client != nil && d.client.Transport != nil {
+		if _, ok := d.client.Transport.(*http.Transport); !ok {
+			return d.client.Transport
+		}
+	}
+
+	baseTransport := http.DefaultTransport.(*http.Transport).Clone()
+	if d.client != nil {
+		if existing, ok := d.client.Transport.(*http.Transport); ok && existing != nil {
+			baseTransport = existing.Clone()
+		}
+	}
+
+	baseTransport.Proxy = nil
+	baseTransport.DialContext = d.dialValidatedTarget
+	return baseTransport
+}
+
+func (d *HTTPDispatcher) dialValidatedTarget(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("split webhook dial target: %w", err)
+	}
+
+	hostname := normalizeHostname(host)
+	if hostname == "" {
+		return nil, fmt.Errorf("webhook dial target is missing hostname")
+	}
+
+	targetURL := &url.URL{
+		Scheme: "https",
+		Host:   net.JoinHostPort(hostname, port),
+	}
+
+	_, _, ips, err := resolveDispatchTarget(ctx, targetURL, d.targetPolicy, d.lookupIPAddrs)
+	if err != nil {
+		return nil, err
+	}
+
+	var dialErr error
+	for _, ip := range ips {
+		conn, err := d.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+
+		dialErr = errors.Join(dialErr, err)
+	}
+
+	return nil, fmt.Errorf("dial webhook target %q: %w", hostname, dialErr)
 }

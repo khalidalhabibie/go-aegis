@@ -68,6 +68,12 @@ type WorkerConfig struct {
 	TransferOutboxRetryDelay      time.Duration `env:"WORKER_TRANSFER_OUTBOX_RETRY_DELAY" envDefault:"2s"`
 	TransferOutboxProcessingAfter time.Duration `env:"WORKER_TRANSFER_OUTBOX_PROCESSING_AFTER" envDefault:"30s"`
 	WebhookPollInterval           time.Duration `env:"WORKER_WEBHOOK_POLL_INTERVAL" envDefault:"2s"`
+	HealthHost                    string        `env:"WORKER_HEALTH_HOST" envDefault:"127.0.0.1"`
+	HealthPort                    int           `env:"WORKER_HEALTH_PORT" envDefault:"8081"`
+}
+
+func (c WorkerConfig) HealthAddress() string {
+	return net.JoinHostPort(c.HealthHost, strconv.Itoa(c.HealthPort))
 }
 
 type WebhookConfig struct {

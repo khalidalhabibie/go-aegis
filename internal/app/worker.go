@@ -15,9 +15,11 @@ import (
 	"github.com/rs/zerolog"
 )
 
-const (
-	initialSubsystemRestartBackoff = 2 * time.Second
-	maxSubsystemRestartBackoff     = 30 * time.Second
+var (
+	initialSubsystemRestartBackoff    = 2 * time.Second
+	maxSubsystemRestartBackoff        = 30 * time.Second
+	subsystemHealthyRunResetThreshold = time.Minute
+	maxConsecutiveSubsystemFailures   = 5
 )
 
 func RunWorker(ctx context.Context) error {
@@ -88,6 +90,17 @@ func RunWorker(ctx context.Context) error {
 		container.Logger,
 	)
 
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	statusTracker := newWorkerStatusTracker(cfg)
+	for _, subsystem := range []string{
+		"transfer_outbox_dispatcher",
+		"transfer_consumer",
+		"webhook_worker",
+	} {
+		statusTracker.RegisterSubsystem(subsystem)
+	}
+
 	container.Logger.Info().
 		Str("queue", cfg.RabbitMQ.TransferQueue).
 		Str("routing_key", cfg.RabbitMQ.TransferRoutingKey).
@@ -95,8 +108,11 @@ func RunWorker(ctx context.Context) error {
 		Msg("worker ready")
 
 	var waitGroup sync.WaitGroup
+	fatalSubsystemErrs := make(chan error, 1)
+	healthServerErrs, stopHealthServer := startWorkerHealthServer(runCtx, cfg.Worker, statusTracker, container.Logger)
+	defer stopHealthServer()
 
-	superviseWorkerSubsystem(ctx, &waitGroup, "transfer_outbox_dispatcher", container.Logger, func(runCtx context.Context) error {
+	superviseWorkerSubsystem(runCtx, &waitGroup, fatalSubsystemErrs, statusTracker, "transfer_outbox_dispatcher", container.Logger, func(runCtx context.Context) error {
 		if err := outboxDispatcher.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 			return fmt.Errorf("run transfer outbox dispatcher: %w", err)
 		}
@@ -104,7 +120,7 @@ func RunWorker(ctx context.Context) error {
 		return nil
 	})
 
-	superviseWorkerSubsystem(ctx, &waitGroup, "transfer_consumer", container.Logger, func(runCtx context.Context) error {
+	superviseWorkerSubsystem(runCtx, &waitGroup, fatalSubsystemErrs, statusTracker, "transfer_consumer", container.Logger, func(runCtx context.Context) error {
 		subscription, consumeErr := container.RabbitMQ.Consume(cfg.RabbitMQ.TransferQueue, cfg.Worker.ConsumerTag)
 		if consumeErr != nil {
 			return fmt.Errorf("start transfer consumer: %w", consumeErr)
@@ -129,7 +145,7 @@ func RunWorker(ctx context.Context) error {
 		return nil
 	})
 
-	superviseWorkerSubsystem(ctx, &waitGroup, "webhook_worker", container.Logger, func(runCtx context.Context) error {
+	superviseWorkerSubsystem(runCtx, &waitGroup, fatalSubsystemErrs, statusTracker, "webhook_worker", container.Logger, func(runCtx context.Context) error {
 		webhookWorker := webhooks.NewWorker(webhookService, cfg.Worker.WebhookPollInterval)
 		if err := webhookWorker.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
 			return fmt.Errorf("run webhook worker: %w", err)
@@ -138,7 +154,21 @@ func RunWorker(ctx context.Context) error {
 		return nil
 	})
 
-	<-ctx.Done()
+	select {
+	case err, ok := <-healthServerErrs:
+		if ok && err != nil {
+			cancel()
+			waitGroup.Wait()
+			return err
+		}
+	case err := <-fatalSubsystemErrs:
+		container.Logger.Error().Err(err).Msg("worker exiting because a subsystem exceeded its failure budget")
+		cancel()
+		waitGroup.Wait()
+		return err
+	case <-ctx.Done():
+	}
+
 	container.Logger.Info().Dur("timeout", cfg.App.ShutdownTimeout).Msg("worker shutdown requested")
 	waitGroup.Wait()
 
@@ -148,6 +178,8 @@ func RunWorker(ctx context.Context) error {
 func superviseWorkerSubsystem(
 	ctx context.Context,
 	waitGroup *sync.WaitGroup,
+	fatalSubsystemErrs chan<- error,
+	tracker *workerStatusTracker,
 	name string,
 	log zerolog.Logger,
 	run func(context.Context) error,
@@ -158,6 +190,7 @@ func superviseWorkerSubsystem(
 		defer waitGroup.Done()
 
 		backoff := initialSubsystemRestartBackoff
+		consecutiveFailures := 0
 
 		for {
 			if ctx.Err() != nil {
@@ -165,32 +198,76 @@ func superviseWorkerSubsystem(
 				return
 			}
 
+			if tracker != nil {
+				tracker.MarkRunning(name)
+			}
 			log.Info().Str("subsystem", name).Msg("worker subsystem started")
+			startedAt := time.Now()
 
 			err := run(ctx)
+			runtime := time.Since(startedAt)
+			if runtime >= subsystemHealthyRunResetThreshold {
+				consecutiveFailures = 0
+				backoff = initialSubsystemRestartBackoff
+			}
+
 			switch {
 			case err == nil:
 				if ctx.Err() != nil {
+					if tracker != nil {
+						tracker.MarkStopped(name, runtime)
+					}
 					log.Info().Str("subsystem", name).Msg("worker subsystem stopped")
 					return
 				}
 
+				consecutiveFailures++
+				if tracker != nil {
+					tracker.MarkRestarting(name, runtime, consecutiveFailures, nil)
+				}
 				log.Warn().Str("subsystem", name).Msg("worker subsystem exited unexpectedly; restarting")
 			case errors.Is(err, context.Canceled):
+				if tracker != nil {
+					tracker.MarkStopped(name, runtime)
+				}
 				log.Info().Str("subsystem", name).Msg("worker subsystem stopped")
 				return
 			default:
+				consecutiveFailures++
+				if tracker != nil {
+					tracker.MarkRestarting(name, runtime, consecutiveFailures, err)
+				}
 				log.Error().
 					Err(err).
 					Str("subsystem", name).
+					Int("consecutive_failures", consecutiveFailures).
 					Dur("restart_backoff", backoff).
 					Msg("worker subsystem failed; restarting")
+			}
+
+			if consecutiveFailures >= maxConsecutiveSubsystemFailures {
+				fatalErr := fmt.Errorf(
+					"worker subsystem %s exceeded failure budget after %d consecutive failures",
+					name,
+					consecutiveFailures,
+				)
+				if tracker != nil {
+					tracker.MarkFatal(name, runtime, consecutiveFailures, fatalErr)
+				}
+				select {
+				case fatalSubsystemErrs <- fatalErr:
+				default:
+				}
+				return
 			}
 
 			timer := time.NewTimer(backoff)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
+				if tracker != nil {
+					tracker.MarkStopped(name, runtime)
+				}
 				log.Info().Str("subsystem", name).Msg("worker subsystem stopped")
 				return
 			case <-timer.C:

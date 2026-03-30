@@ -93,7 +93,11 @@ func (c *Consumer) handleDelivery(ctx context.Context, delivery amqp.Delivery) e
 		return delivery.Nack(false, true)
 	}
 
+	heartbeatStop := func() {}
+	var heartbeatErrs <-chan error
 	if lock != nil {
+		processCtx, processCancel := context.WithCancel(ctx)
+		heartbeatStop, heartbeatErrs = c.startProcessingLockHeartbeat(processCtx, processCancel, lock)
 		defer func() {
 			if releaseErr := lock.Release(ctx); releaseErr != nil {
 				c.log.Error().
@@ -101,10 +105,19 @@ func (c *Consumer) handleDelivery(ctx context.Context, delivery amqp.Delivery) e
 					Str("transfer_id", job.TransferID).
 					Msg("release transfer processing lock")
 			}
+			processCancel()
 		}()
+		ctx = processCtx
 	}
 
 	transfer, err := c.processor.ProcessTransfer(ctx, job.TransferID)
+	heartbeatStop()
+	if heartbeatErrs != nil {
+		if heartbeatErr := <-heartbeatErrs; heartbeatErr != nil && (err == nil || errors.Is(err, context.Canceled)) {
+			err = heartbeatErr
+		}
+	}
+
 	if err == nil {
 		c.log.Info().
 			Str("transfer_id", transfer.ID).
@@ -140,6 +153,57 @@ func (c *Consumer) handleDelivery(ctx context.Context, delivery amqp.Delivery) e
 			Msg("transfer job failed permanently")
 		return delivery.Ack(false)
 	}
+}
+
+func (c *Consumer) startProcessingLockHeartbeat(
+	ctx context.Context,
+	cancelProcessing context.CancelFunc,
+	lock ProcessingLock,
+) (func(), <-chan error) {
+	errs := make(chan error, 1)
+
+	if lock == nil || c.lockTTL <= 0 {
+		close(errs)
+		return func() {}, errs
+	}
+
+	interval := c.lockTTL / 3
+	if interval <= 0 {
+		interval = time.Second
+	}
+
+	if interval > 5*time.Second {
+		interval = 5 * time.Second
+	}
+
+	heartbeatCtx, stopHeartbeat := context.WithCancel(context.Background())
+
+	go func() {
+		defer close(errs)
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-heartbeatCtx.Done():
+				return
+			case <-ticker.C:
+				if err := lock.Refresh(ctx, c.lockTTL); err != nil {
+					if cancelProcessing != nil {
+						cancelProcessing()
+					}
+
+					errs <- TransientError{Operation: "refresh processing lock", Err: err}
+					return
+				}
+			}
+		}
+	}()
+
+	return stopHeartbeat, errs
 }
 
 func (c *Consumer) acquireProcessingLock(ctx context.Context, transferID string) (ProcessingLock, bool, error) {
