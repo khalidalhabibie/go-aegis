@@ -47,10 +47,15 @@ func (c HTTPConfig) Address() string {
 }
 
 type WorkerConfig struct {
-	ConsumerTag         string        `env:"WORKER_CONSUMER_TAG" envDefault:"aegis-worker"`
-	TransferMaxRetries  int           `env:"WORKER_TRANSFER_MAX_RETRIES" envDefault:"3"`
-	TransferRetryDelay  time.Duration `env:"WORKER_TRANSFER_RETRY_DELAY" envDefault:"2s"`
-	WebhookPollInterval time.Duration `env:"WORKER_WEBHOOK_POLL_INTERVAL" envDefault:"2s"`
+	ConsumerTag                   string        `env:"WORKER_CONSUMER_TAG" envDefault:"aegis-worker"`
+	TransferMaxRetries            int           `env:"WORKER_TRANSFER_MAX_RETRIES" envDefault:"3"`
+	TransferRetryDelay            time.Duration `env:"WORKER_TRANSFER_RETRY_DELAY" envDefault:"2s"`
+	TransferProcessLockTTL        time.Duration `env:"WORKER_TRANSFER_PROCESS_LOCK_TTL" envDefault:"30s"`
+	TransferOutboxPollInterval    time.Duration `env:"WORKER_TRANSFER_OUTBOX_POLL_INTERVAL" envDefault:"2s"`
+	TransferOutboxBatchSize       int           `env:"WORKER_TRANSFER_OUTBOX_BATCH_SIZE" envDefault:"25"`
+	TransferOutboxRetryDelay      time.Duration `env:"WORKER_TRANSFER_OUTBOX_RETRY_DELAY" envDefault:"2s"`
+	TransferOutboxProcessingAfter time.Duration `env:"WORKER_TRANSFER_OUTBOX_PROCESSING_AFTER" envDefault:"30s"`
+	WebhookPollInterval           time.Duration `env:"WORKER_WEBHOOK_POLL_INTERVAL" envDefault:"2s"`
 }
 
 type WebhookConfig struct {

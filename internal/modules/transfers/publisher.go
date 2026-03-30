@@ -40,7 +40,7 @@ func (p *RabbitMQJobPublisher) PublishTransferRequested(ctx context.Context, job
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		Body:         body,
-		Type:         "transfer.requested",
+		Type:         OutboxEventTypeTransferRequested,
 	}); err != nil {
 		return fmt.Errorf("publish transfer job: %w", err)
 	}

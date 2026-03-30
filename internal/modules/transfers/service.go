@@ -35,7 +35,6 @@ func (e ValidationError) Unwrap() error {
 
 type Service struct {
 	repository Repository
-	publisher  JobPublisher
 	log        zerolog.Logger
 }
 
@@ -61,10 +60,9 @@ type ListResult struct {
 	Offset int
 }
 
-func NewService(repository Repository, publisher JobPublisher, log zerolog.Logger) *Service {
+func NewService(repository Repository, log zerolog.Logger) *Service {
 	return &Service{
 		repository: repository,
-		publisher:  publisher,
 		log:        log,
 	}
 }
@@ -80,24 +78,11 @@ func (s *Service) CreateTransfer(ctx context.Context, input CreateInput) (Transf
 		return Transfer{}, false, err
 	}
 
-	if s.publisher != nil && transfer.Status == StatusCreated {
-		job := TransferJob{TransferID: transfer.ID, Attempt: 0}
-		if err := s.publisher.PublishTransferRequested(ctx, job); err != nil {
-			s.log.Error().
-				Err(err).
-				Str("transfer_id", transfer.ID).
-				Str("idempotency_key", transfer.IdempotencyKey).
-				Bool("created", created).
-				Msg("publish transfer job failed")
-			return Transfer{}, false, fmt.Errorf("publish transfer job: %w", err)
-		}
-
-		s.log.Info().
-			Str("transfer_id", transfer.ID).
-			Str("status", transfer.Status).
-			Bool("created", created).
-			Msg("transfer job published")
-	}
+	s.log.Info().
+		Str("transfer_id", transfer.ID).
+		Str("status", transfer.Status).
+		Bool("created", created).
+		Msg("transfer request persisted")
 
 	return transfer, created, nil
 }
